@@ -53,12 +53,12 @@ class TestQAService:
 
     # ── 核心测试 ──
 
-    @patch("research_assistant.tools.qa.get_llm")
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.get_llm")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_chat_no_tools_called(self, mock_wm, mock_hr, mock_get_llm):
         """闲聊场景: LLM 不调工具，直接回答。"""
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_hr.return_value.search_papers_expanded = Mock(return_value=[])
         mock_hr.return_value.search_progress = Mock(return_value=[])
@@ -81,15 +81,16 @@ class TestQAService:
         mock_hr.return_value.search_papers_expanded.assert_not_called()
         mock_wm.return_value.add_turn.assert_called_once()
 
-    @patch("research_assistant.tools.qa.get_llm")
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
-    def test_agent_calls_tool_then_answers(self, mock_wm, mock_hr, mock_get_llm):
+    @patch("research_assistant.rag.retrieval.HybridRetriever")
+    @patch("research_assistant.agent.qa.get_llm")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
+    def test_agent_calls_tool_then_answers(self, mock_wm, mock_agent_hr, mock_get_llm, mock_rag_hr):
         """科研问题: Agent 调 query_knowledge_base，拿到结果后回答。"""
         from langchain_core.messages import AIMessage
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
-        mock_hr.return_value.search_papers_expanded = Mock(return_value=[
+        mock_rag_hr.return_value.search_papers_expanded = Mock(return_value=[
             {
                 "paper_id": 1, "title": "金刚石研磨工艺研究",
                 "heading_path": "3.2 研磨参数",
@@ -99,7 +100,7 @@ class TestQAService:
                 "payload": {"text": "W10微粉600rpm Ra 2.1nm"},
             },
         ])
-        mock_hr.return_value.search_progress = Mock(return_value=[])
+        mock_rag_hr.return_value.search_progress = Mock(return_value=[])
         mock_wm.return_value.get_context = Mock(return_value="")
         mock_wm.return_value.add_turn = Mock()
         mock_wm.return_value.stats.return_value = {"active_turns": 0}
@@ -127,16 +128,16 @@ class TestQAService:
         assert "Ra 2.1" in result["answer"]
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["tool"] == "query_knowledge_base"
-        mock_hr.return_value.search_papers_expanded.assert_called_once()
+        mock_rag_hr.return_value.search_papers_expanded.assert_called_once()
         mock_wm.return_value.add_turn.assert_called_once()
 
-    @patch("research_assistant.tools.qa.get_llm")
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.get_llm")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_agent_calls_multiple_tools(self, mock_wm, mock_hr, mock_get_llm):
         """混合场景: Agent 同时调 query_knowledge_base + recall_history。"""
         from langchain_core.messages import AIMessage
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_hr.return_value.search_papers_expanded = Mock(return_value=[
             {
@@ -183,13 +184,13 @@ class TestQAService:
         assert "query_knowledge_base" in tool_names
         assert "recall_history" in tool_names
 
-    @patch("research_assistant.tools.qa.get_llm")
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.get_llm")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_agent_no_results_honest_answer(self, mock_wm, mock_hr, mock_get_llm):
         """工具无结果时 Agent 诚实告知，不编造。"""
         from langchain_core.messages import AIMessage
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_hr.return_value.search_papers_expanded = Mock(return_value=[])
         mock_hr.return_value.search_progress = Mock(return_value=[])
@@ -220,12 +221,12 @@ class TestQAService:
 
     # ── 工作记忆 ──
 
-    @patch("research_assistant.tools.qa.get_llm")
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.get_llm")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_working_memory_accumulates(self, mock_wm, mock_hr, mock_get_llm):
         """工作记忆随对话累积。"""
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_hr.return_value.search_papers_expanded = Mock(return_value=[])
         mock_hr.return_value.search_progress = Mock(return_value=[])
@@ -246,11 +247,11 @@ class TestQAService:
 
     # ── 会话管理 ──
 
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_end_session_clears_and_saves(self, mock_wm, mock_hr):
         """end_session 清理工作记忆并保存摘要。"""
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_wm.return_value.get_context = Mock(return_value="")
         mock_wm.return_value.get_session_summary = Mock(return_value={
@@ -264,11 +265,11 @@ class TestQAService:
 
     # ── _build_context ──
 
-    @patch("research_assistant.tools.qa.HybridRetriever")
-    @patch("research_assistant.tools.qa.WorkingMemory")
+    @patch("research_assistant.agent.qa.HybridRetriever")
+    @patch("research_assistant.agent.qa.WorkingMemory")
     def test_build_context_includes_profile_and_history(self, mock_wm, mock_hr):
         """_build_context 注入用户画像和工作记忆。"""
-        from research_assistant.tools.qa import QAService
+        from research_assistant.agent.qa import QAService
 
         mock_wm.return_value.get_context = Mock(
             return_value="Q: 上次问题\nA: 上次回答"
