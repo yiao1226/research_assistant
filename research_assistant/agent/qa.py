@@ -1,15 +1,14 @@
-"""智能问答服务 — Agent + 工具调用。
+"""智能问答服务 — Agent 循环 + Hook + 动态工具映射。
 
-架构变化:
-  旧: 输入 → LLM 分类(chat/recall/research/direction) → 固定分支 → 回答
-  新: 输入 → LLM + 4 工具(统一从 tools/ 加载) → 自主决策 → 回答
-
-工具来源: tools/kb.py, tools/search.py, tools/history.py
-  Agent 和 LangGraph 共用同一套工具，不再各自定义闭包。
+核心设计（参考 Claude Code 架构）:
+  agent_loop() → 可见的循环体，Hook 挂横切逻辑
+  build_system() → 工具描述从定义生成，不硬编码
+  hooks → PreToolUse / PostToolUse / BeforeLLM / AfterLLM
 """
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
@@ -21,21 +20,75 @@ from ..tools import make_all_agent_tools
 
 logger = logging.getLogger(__name__)
 
-AGENT_SYSTEM_PROMPT = """你是科研助手，帮助用户进行学术研究。你有以下工具可以调用:
+# ============================================================
+# Hook 系统
+# ============================================================
 
-## 工具说明
+HOOKS: dict[str, list[Callable]] = {
+    "before_llm": [],      # (messages) → None
+    "after_llm": [],       # (response) → None
+    "pre_tool": [],        # (tool_name, tool_args) → str|None (返回非None=拦截)
+    "post_tool": [],       # (tool_name, tool_args, result) → None
+    "agent_start": [],     # (question) → None
+    "agent_end": [],       # (result) → None
+}
 
-1. **query_knowledge_base(query, limit)** — 搜索本地论文知识库
-   适用: 科研问题、论文数据查询、领域进展
 
-2. **query_progress(query, limit)** — 查询用户研究进展记录
-   适用: "我做过什么实验"、"进展如何"
+def register_hook(event: str, callback: Callable):
+    HOOKS[event].append(callback)
 
-3. **recall_history(query, limit)** — 搜索历史会话讨论
-   适用: "上次讨论了什么"、"之前分析过XX"
 
-4. **search_papers_online(query)** — 外部搜索新论文(ArXiv + S2)
-   适用: "找一下XX的最新论文"、"搜索XX领域"
+def trigger_hooks(event: str, *args):
+    """触发 Hook，pre_tool 的拦截值会传播。"""
+    for cb in HOOKS[event]:
+        result = cb(*args)
+        if event == "pre_tool" and result is not None:
+            return result  # 拦截
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# 内置 Hook: 进度显示 + 工具日志
+# ═══════════════════════════════════════════════════════════
+
+def _progress_hook(question: str):
+    """agent_start: 显示当前轮次和问题。"""
+    print(f"\n🤖 分析: {question[:60]}...")
+
+def _tool_log_hook(name: str, args: dict):
+    """pre_tool: 显示工具调用。"""
+    arg_preview = {k: str(v)[:60] for k, v in args.items()}
+    print(f"  🔧 {name}({arg_preview})")
+    return None
+
+def _tool_result_hook(_name: str, _args: dict, result: str):
+    """post_tool: 显示工具结果摘要。"""
+    preview = str(result)[:100].replace("\n", " ")
+    print(f"     → {preview}")
+
+def _agent_done_hook(result: dict):
+    """agent_end: 显示统计。"""
+    calls = len(result.get("tool_calls", []))
+    if calls:
+        tools_used = {tc["tool"] for tc in result["tool_calls"]}
+        print(f"✅ 完成 ({calls}次工具调用: {', '.join(tools_used)})")
+
+
+register_hook("agent_start", _progress_hook)
+register_hook("pre_tool", _tool_log_hook)
+register_hook("post_tool", _tool_result_hook)
+register_hook("agent_end", _agent_done_hook)
+
+
+# ============================================================
+# System Prompt 动态组装（工具描述从定义生成，不硬编码）
+# ============================================================
+
+AGENT_SYSTEM_TEMPLATE = """你是科研助手，帮助用户进行学术研究。
+
+## 可用工具
+
+{tools}
 
 ## 决策原则
 
@@ -57,8 +110,134 @@ AGENT_SYSTEM_PROMPT = """你是科研助手，帮助用户进行学术研究。�
 {context}"""
 
 
+def build_system_prompt(tools: list, context: str) -> str:
+    """从工具定义动态生成 System Prompt。
+
+    工具描述来自 @tool 的 docstring，不用人工维护。
+    """
+    tool_lines = []
+    for i, t in enumerate(tools, 1):
+        # 从工具定义中提取 name + description
+        desc = t.description.split("\n")[0] if t.description else str(t.name)
+        tool_lines.append(f"{i}. **{t.name}** — {desc}")
+    return AGENT_SYSTEM_TEMPLATE.format(
+        tools="\n".join(tool_lines),
+        context=context,
+    )
+
+
+# ============================================================
+# Agent 循环（可见的循环体 + 流式输出）
+# ============================================================
+
+def agent_loop(
+    messages: list,
+    tools: list,
+    llm,
+    max_rounds: int = 3,
+    stream: bool = True,
+) -> tuple[list, list]:
+    """Agent 循环 — 工具调用用 invoke，最终回答用 stream。
+
+    设计:
+      - 工具调用阶段: invoke → 需要完整 tool_calls 才能执行
+      - 最终回答: stream → 逐 token 输出，用户看到打字效果
+
+    Args:
+        messages: [SystemMessage, HumanMessage, ...]
+        tools: LangChain @tool 列表
+        llm: bind_tools 后的 LLM（invoke 用）
+        max_rounds: 最多工具调用轮次
+        stream: 最终回答是否流式输出
+
+    Returns:
+        (messages, tool_calls_log)
+    """
+    tool_log = []
+
+    for round_num in range(max_rounds):
+        trigger_hooks("before_llm", messages)
+
+        # ── 先用 invoke 检测是否有工具调用 ──
+        response = llm.invoke(messages)
+        has_tools = hasattr(response, 'tool_calls') and response.tool_calls
+
+        # ── 有工具调用 → 执行后继续 ──
+        if has_tools:
+            trigger_hooks("after_llm", response)
+            messages.append(response)
+            for tc in response.tool_calls:
+                name = tc.get("name", "unknown")
+                args = tc.get("args", {})
+                tid = tc.get("id", "")
+
+                blocked = trigger_hooks("pre_tool", name, args)
+                result = str(blocked) if blocked else _exec_tool(tc, tools)
+                tool_log.append({"tool": name, "args": args, "result_len": len(str(result))})
+                trigger_hooks("post_tool", name, args, result)
+
+                messages.append(ToolMessage(content=str(result), tool_call_id=tid))
+            continue
+
+        # ── 无工具调用 → 流式输出最终回答 ──
+        if stream:
+            _stream_answer(llm, messages, response)
+        else:
+            messages.append(response)
+
+        trigger_hooks("after_llm", messages[-1])
+        break
+
+    return messages, tool_log
+
+
+def _stream_answer(llm, messages, invoke_response):
+    """用 stream 流式输出最终回答，逐 token 打印。
+
+    容错: 如果 llm 没 stream 方法（如 mock）→ 降级为一次性输出。
+    """
+    import sys
+
+    try:
+        stream_method = llm.stream
+    except AttributeError:
+        # 降级: 直接输出 invoke 结果
+        text = str(invoke_response.content) if hasattr(invoke_response, 'content') else str(invoke_response)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        print()
+        messages.append(invoke_response)
+        return
+
+    accumulated = []
+    try:
+        for chunk in stream_method(messages):
+            if chunk.content:
+                sys.stdout.write(chunk.content)
+                sys.stdout.flush()
+                accumulated.append(chunk.content)
+    except Exception:
+        # stream 失败 → 降级
+        text = str(invoke_response.content) if hasattr(invoke_response, 'content') else str(invoke_response)
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        accumulated = [text]
+
+    full = "".join(accumulated)
+    if full.strip():
+        from langchain_core.messages import AIMessage
+        messages.append(AIMessage(content=full))
+    else:
+        messages.append(invoke_response)
+    print()
+
+
+# ═══════════════════════════════════════════════════════════
+# QAService
+# ═══════════════════════════════════════════════════════════
+
 class QAService:
-    """智能问答服务 — Agent 驱动，工具统一从 tools/ 加载。"""
+    """智能问答服务。"""
 
     def __init__(self, username: str, storage: PerUserStorage):
         self.username = username
@@ -66,121 +245,75 @@ class QAService:
         self.retriever = HybridRetriever(storage, username)
         self.working = WorkingMemory(username, str(storage.user_dir))
 
-    # ── 主入口 ──
-
     def ask(self, question: str) -> dict:
-        """Agent 循环: LLM + 工具自主调用。
+        """主入口: 组装 → agent_loop → 回答。"""
+        trigger_hooks("agent_start", question)
 
-        Returns:
-            {"answer": str, "cited_papers": [...], "tool_calls": [...]}
-        """
+        # 工具 + 动态 System Prompt
         tools = make_all_agent_tools(self.storage, self.username)
         context = self._build_context()
+        system = build_system_prompt(tools, context)
 
         llm = get_llm(temperature=0.3, max_tokens=2048)
         llm_with_tools = llm.bind_tools(tools)
 
         messages = [
-            SystemMessage(content=AGENT_SYSTEM_PROMPT.format(context=context)),
+            SystemMessage(content=system),
             HumanMessage(content=question),
         ]
 
-        tool_calls_log = []
-        cited_papers = []
+        # ── Agent 循环 ──
+        messages, tool_log = agent_loop(messages, tools, llm_with_tools)
 
-        for _ in range(3):
-            response = llm_with_tools.invoke(messages)
+        # 提取回答和引用
+        final = messages[-1]
+        answer = str(final.content) if hasattr(final, 'content') else ""
+        cited = _extract_cited_from_messages(messages)
 
-            if not (hasattr(response, 'tool_calls') and response.tool_calls):
-                messages.append(response)
-                break
+        self.working.add_turn(question, answer, cited, "")
 
-            messages.append(response)
-            for tc in response.tool_calls:
-                tool_name = tc.get("name", "unknown")
-                tool_args = tc.get("args", {})
-                tool_id = tc.get("id", "")
-
-                logger.info("Agent 调用工具: %s(%s)", tool_name,
-                            {k: str(v)[:80] for k, v in tool_args.items()})
-
-                tool_result = _exec_tool(tc, tools)
-                tool_calls_log.append({
-                    "tool": tool_name, "args": tool_args,
-                    "result_len": len(str(tool_result)),
-                })
-
-                if tool_name == "query_knowledge_base":
-                    cited_papers.extend(_extract_cited(str(tool_result)))
-
-                messages.append(ToolMessage(
-                    content=str(tool_result), tool_call_id=tool_id,
-                ))
-
-        final_msg = messages[-1]
-        answer = str(final_msg.content) if hasattr(final_msg, 'content') else ""
-        self.working.add_turn(question, answer, cited_papers, "")
-
-        return {
-            "answer": answer,
-            "cited_papers": cited_papers,
-            "tool_calls": tool_calls_log,
-        }
-
-    # ── 上下文构建 ──
+        result = {"answer": answer, "cited_papers": cited, "tool_calls": tool_log, "streamed": True}
+        trigger_hooks("agent_end", result)
+        return result
 
     def _build_context(self) -> str:
-        """构建 Agent 上下文（用户画像 + 工作记忆 + 进展摘要）。"""
         parts = []
-
-        # 用户画像
         try:
             from ..memory.user_profile import UserProfileManager
             profile_mgr = UserProfileManager(self.username, str(self.storage.user_dir))
-            profile_text = profile_mgr.build_context_for_qa()
-            if profile_text:
-                parts.append(profile_text)
+            text = profile_mgr.build_context_for_qa()
+            if text:
+                parts.append(text)
         except Exception:
-            logger.debug("用户画像注入跳过", exc_info=True)
+            pass
 
-        # 工作记忆
         wm = self.working.get_context(3)
         if wm:
             parts.append(f"## 最近对话\n{wm}")
 
-        # 进展摘要
         try:
             progress = self.storage.get_all_progress(limit=5)
             if progress:
                 lines = ["## 用户研究进展"]
                 for p in progress:
-                    lines.append(
-                        f"- [{p.get('entry_type', '?')}] {p.get('title', '')}: "
-                        f"{p.get('insights', '') or p.get('content', '')[:80]}"
-                    )
+                    lines.append(f"- [{p.get('entry_type', '?')}] {p.get('title', '')}: "
+                                 f"{p.get('insights', '') or p.get('content', '')[:80]}")
                 parts.append("\n".join(lines))
         except Exception:
             pass
 
-        # 未解决问题
         try:
             from ..memory.episodic import EpisodicMemory
             em = EpisodicMemory(self.storage, self.username)
             unresolved = em.get_unresolved_questions(limit=3)
             if unresolved:
-                lines = ["## 上次未解决问题"]
-                for q in unresolved:
-                    lines.append(f"- {q}")
-                parts.append("\n".join(lines))
+                parts.append("## 上次未解决问题\n" + "\n".join(f"- {q}" for q in unresolved))
         except Exception:
             pass
 
         return "\n\n".join(parts) if parts else "（首次对话，无语境上下文）"
 
-    # ── 会话管理 ──
-
     def end_session(self):
-        """结束会话: 刷盘事实 + 生成摘要。"""
         summary = self.working.get_session_summary()
         try:
             from ..memory.episodic import EpisodicMemory
@@ -194,10 +327,11 @@ class QAService:
         return {"working_memory": self.working.stats()}
 
 
-# ── 工具执行辅助（模块级，qa/graph 共用）──
+# ============================================================
+# 辅助函数
+# ============================================================
 
 def _exec_tool(tc: dict, tools: list) -> str:
-    """执行工具调用，返回结果文本。"""
     name = tc.get("name", "")
     for t in tools:
         if t.name == name:
@@ -206,14 +340,16 @@ def _exec_tool(tc: dict, tools: list) -> str:
                 return str(result) if result else "（空结果）"
             except Exception as e:
                 logger.warning("工具 %s 失败: %s", name, e)
-                return f"（工具执行失败: {e}）"
+                return f"（工具失败: {e}）"
     return f"（未知工具: {name}）"
 
 
-def _extract_cited(text: str) -> list[dict]:
-    """从工具返回文本提取 [论文N] 引用。"""
+def _extract_cited_from_messages(messages: list) -> list[dict]:
     import re
     papers = []
-    for m in re.finditer(r'\[论文(\d+)\]\s+(.+)', text):
-        papers.append({"index": int(m.group(1)), "title": m.group(2)[:100]})
+    for msg in messages:
+        if hasattr(msg, 'content'):
+            text = str(msg.content)
+            for m in re.finditer(r'\[论文(\d+)\]\s+(.+)', text):
+                papers.append({"index": int(m.group(1)), "title": m.group(2)[:100]})
     return papers

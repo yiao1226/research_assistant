@@ -343,9 +343,11 @@ def interactive_mode():
             tools_used = {tc['tool'] for tc in tool_calls}
             print(f'🔧 调用了: {", ".join(tools_used)}  ({len(tool_calls)}次)')
 
-        print(f'\n{"=" * 60}')
-        print(result['answer'])
-        print(f'{"=" * 60}')
+        # 流式输出已在 agent_loop 里打印过，不重复
+        if not result.get('streamed'):
+            print(f'\n{"=" * 60}')
+            print(result['answer'])
+            print(f'{"=" * 60}')
 
         cited = result.get('cited_papers', [])
         if cited:
@@ -390,13 +392,15 @@ if __name__ == "__main__":
             qa = get_qa()
             if qa:
                 result = qa.ask(arg)
-                print(result["answer"])
+                if not result.get("streamed"):
+                    print(result["answer"])
         else:
             # 降级: 全部当 Agent 输入
             qa = get_qa()
             if qa:
                 full = " ".join(sys.argv[1:])
                 result = qa.ask(full)
-                print(result["answer"])
+                if not result.get("streamed"):
+                    print(result["answer"])
     else:
         interactive_mode()

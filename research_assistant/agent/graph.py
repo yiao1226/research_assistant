@@ -1,14 +1,17 @@
-"""科研助手 LangGraph 工作流 — Agent 驱动，3 路径，4 节点。
+"""科研助手 LangGraph 工作流 — Agent 驱动 + Hook。
 
-工具来源: tools/kb.py, tools/search.py, tools/history.py
-  Agent(qa.py) 和 graph.py 共用 make_all_agent_tools()。
+4 节点 / 3 路径 / research 可迭代 / Hook 可挂载
+
+Hook 事件:
+  node_start(name, state) / node_end(name, state)
+  research_iteration(n, papers_count, satisfied)
 """
 from __future__ import annotations
 
 import logging
 import os
 import sqlite3
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -25,46 +28,78 @@ from ..state import ResearchState, get_runtime_context
 from ..tools import make_all_agent_tools
 from ..tools.kb import make_kb_tools
 from ..tools.history import make_history_tool
-from ..agent.qa import _exec_tool  # 复用工具执行辅助
+from ..agent.qa import _exec_tool
 
 # ============================================================
-# Agent 系统提示词
+# Graph Hook 系统
 # ============================================================
 
-UNDERSTAND_SYSTEM = """你是科研策略规划专家。在搜索之前先盘点已有知识基础。
+GRAPH_HOOKS: dict[str, list[Callable]] = {
+    "node_start": [],  # (node_name, state) → None
+    "node_end": [],    # (node_name, state) → None
+    "research_loop": [],  # (iteration, papers_count, satisfied) → None
+}
 
-工具有:
-- query_knowledge_base: 搜索本地论文库
-- query_progress: 查看研究进展
-- recall_history: 搜索历史会话
 
-输出:
-1. 已有基础: KB论文、进展、历史讨论
-2. 搜索计划: 关键词(中英各2-3)、重点方向"""
+def register_graph_hook(event: str, callback: Callable):
+    GRAPH_HOOKS[event].append(callback)
 
-RESEARCH_SYSTEM = """你是学术文献搜索专家。搜索论文并评估质量。
 
-工具有:
-- search_papers_online: 外部搜索(ArXiv + Semantic Scholar)
-- query_knowledge_base: 本地论文搜索
+def _trigger(event: str, *args):
+    for cb in GRAPH_HOOKS[event]:
+        cb(*args)
 
-策略:
-1. 核心关键词搜索 → 评估覆盖度
-2. 不足就换角度重搜(如加method/fabrication)
+# ============================================================
+# System Prompt 模板（动态注入工具描述）
+# ============================================================
+
+NODE_PROMPTS = {
+    "understand": """你是科研策略规划专家。在搜索之前先盘点已有知识基础。
+
+## 可用工具
+{tools}
+
+## 你需要产出
+1. 已有基础: KB有什么论文、进展记录了哪些实验、历史讨论过什么
+2. 搜索计划: 关键词(中英各2-3)、重点方向、搜索策略""",
+
+    "research": """你是学术文献搜索专家。搜索论文并评估质量。
+
+## 可用工具
+{tools}
+
+## 策略
+1. 核心关键词搜索 → 评估覆盖度和质量
+2. 不足就换角度重搜(如加method/fabrication关键词)
 3. 满意则输出评估: 总篇数、方向覆盖、质量评价
 
-判断满意标准: 论文>=5且方向覆盖完整、有足够方法细节"""
+## 满意标准
+论文>=5且方向覆盖完整、有足够方法细节。最多建议3轮搜索。""",
 
-SYNTHESIZE_REVIEW_SYSTEM = """你是学术综述专家。撰写正式文献综述。
-
+    "synthesize_review": """你是学术综述专家。撰写正式文献综述。
 结构: 摘要/引言/研究脉络/方法对比(表格)/趋势/结论+参考文献
-要求: 引用[编号], 中文, 2500-4000字"""
+要求: 引用[编号], 中文, 2500-4000字""",
 
-SYNTHESIZE_ANSWER_SYSTEM = """你是科研问答专家。基于搜索分析深度回答问题。
-要求: 有据可查, 引用[论文], 含具体数值"""
+    "synthesize_answer": """你是科研问答专家。基于搜索分析深度回答问题。
+要求: 有据可查, 引用[论文], 含具体数值""",
 
-SYNTHESIZE_REPORT_SYSTEM = """你是科研进展评估专家。综合文献库和进展记录生成报告。
-结构: 文献覆盖度/实验进展/知识缺口/文献对照/下一步建议"""
+    "synthesize_report": """你是科研进展评估专家。综合文献库和进展记录生成报告。
+结构: 文献覆盖度/实验进展/知识缺口/文献对照/下一步建议""",
+}
+
+
+def build_node_prompt(tools: list, node_type: str) -> str:
+    """从工具定义动态生成节点 System Prompt。
+
+    工具列表从 @tool 的 description 自动提取，不硬编码。
+    synthesize 节点不绑工具，不需要 {tools} 占位。
+    """
+    template = NODE_PROMPTS.get(node_type, NODE_PROMPTS["understand"])
+
+    if "{tools}" in template:
+        tool_lines = [f"- **{t.name}**: {t.description.split(chr(10))[0]}" for t in tools]
+        return template.format(tools="\n".join(tool_lines))
+    return template
 
 # ============================================================
 # 节点 ① — understand
@@ -80,11 +115,12 @@ def node_understand(state: ResearchState) -> dict[str, Any]:
 
     llm = get_llm(temperature=0.2, max_tokens=600)
     tools = make_kb_tools(storage, username) + [make_history_tool(storage, username)]
+    system = build_node_prompt(tools, "understand")
     llm_with_tools = llm.bind_tools(tools)
 
     wf_labels = {"review": "文献综述", "research": "深度研究", "progress_report": "进展评估"}
     messages = [
-        SystemMessage(content=UNDERSTAND_SYSTEM),
+        SystemMessage(content=system),
         HumanMessage(content=f"主题: {topic}\n类型: {wf_labels.get(wf_type, wf_type)}\n请盘点已有基础，制定搜索计划。"),
     ]
 
@@ -103,6 +139,7 @@ def node_understand(state: ResearchState) -> dict[str, Any]:
             plan_text = str(response.content)
             break
 
+    _trigger("node_end", "understand", {"search_plan": plan_text})
     return {"search_plan": plan_text, "current_stage": "understand"}
 
 
@@ -122,13 +159,14 @@ def node_research(state: ResearchState) -> dict[str, Any]:
 
     llm = get_llm(temperature=0.3, max_tokens=1024)
     tools = make_all_agent_tools(storage, username)
+    system = build_node_prompt(tools, "research")
     llm_with_tools = llm.bind_tools(tools)
 
     prev_summary = f"已有 {len(papers)} 篇" if papers else "尚无结果"
     prev_titles = "\n".join(f"- {p.get('title', '?')[:80]}" for p in papers[-10:]) if papers else ""
 
     messages = [
-        SystemMessage(content=RESEARCH_SYSTEM),
+        SystemMessage(content=system),
         HumanMessage(content=f"主题: {topic}\n\n搜索计划: {plan}\n\n第{iteration}轮搜索\n{prev_summary}\n{prev_titles}\n\n请搜索论文并评估。"),
     ]
 
@@ -146,6 +184,7 @@ def node_research(state: ResearchState) -> dict[str, Any]:
             messages.append(ToolMessage(content=str(tr), tool_call_id=tc.get("id", "")))
 
     satisfied = _check_satisfied(result_text, len(papers), iteration)
+    _trigger("research_loop", iteration, len(papers), satisfied)
 
     return {
         "papers_found": papers,
@@ -192,11 +231,9 @@ def node_synthesize(state: ResearchState) -> dict[str, Any]:
     papers = state.get("papers_found", [])
 
     material = _fmt_papers(papers)
-    systems = {
-        "review": SYNTHESIZE_REVIEW_SYSTEM,
-        "research": SYNTHESIZE_ANSWER_SYSTEM,
-        "progress_report": SYNTHESIZE_REPORT_SYSTEM,
-    }
+    node_map = {"review": "synthesize_review", "research": "synthesize_answer", "progress_report": "synthesize_report"}
+    system = build_node_prompt([], node_map.get(wf_type, "synthesize_review"))
+
     hints = {
         "review": "撰写正式文献综述(2500-4000字), 含摘要/引言/脉络/对比表格/趋势/结论/参考文献。",
         "research": "深度回答问题，有引用，如需后续方向给出2-3个建议。",
@@ -205,7 +242,7 @@ def node_synthesize(state: ResearchState) -> dict[str, Any]:
 
     llm = get_llm(temperature=0.5, max_tokens=4096)
     response = llm.invoke([
-        SystemMessage(content=systems.get(wf_type, SYNTHESIZE_REVIEW_SYSTEM)),
+        SystemMessage(content=system),
         HumanMessage(content=f"主题: {topic}\n\n论文材料:\n{material}\n\n{hints.get(wf_type, '')}"),
     ])
     output = str(response.content)
