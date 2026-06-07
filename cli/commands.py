@@ -481,6 +481,11 @@ def run_recall(arg):
 
 
 def run_qa(arg):
+    """智能问答 — Agent 自主工具调用。
+
+    无固定意图路由，LLM 自主决定搜索策略。
+    输入以 /ask 开头时走此函数（向后兼容），无前缀输入也会自动路由到此。
+    """
     qa = get_qa()
     if not qa:
         print('请先登录用户。')
@@ -488,6 +493,12 @@ def run_qa(arg):
 
     print()
     result = qa.ask(arg)
+
+    # 工具调用日志（调试/透明度用）
+    tool_calls = result.get('tool_calls', [])
+    if tool_calls:
+        tools_used = {tc['tool'] for tc in tool_calls}
+        print(f'🔧 调用了: {", ".join(tools_used)}  ({len(tool_calls)}次)')
 
     print(f'\n{"=" * 60}')
     print(result['answer'])
@@ -498,18 +509,6 @@ def run_qa(arg):
         print(f'\n📚 引用论文: {len(cited)}篇')
         for i, p in enumerate(cited[:5], 1):
             print(f'  [{i}] {p.get("title","?")[:60]}')
-
-    directions = result.get('directions', [])
-    if directions:
-        print(f'\n📋 后续科研方向:')
-        for i, d in enumerate(directions, 1):
-            print(f'  {i}. [{d.get("priority", "?")}] {d.get("title", "")}')
-            print(f'     {d.get("description", "")}')
-
-    if result.get('progress_recorded'):
-        print(f'\n✅ 后续方向已自动记录到「研究进展」')
-    elif directions:
-        print(f'\n💡 输入 record <主题> 可手动记录这些方向')
 
 
 def run_backup():
@@ -688,6 +687,28 @@ def _rebuild_paper(paper_id: int, paper: dict, storage):
 
 
 def run_review(topic):
+    """文献综述工作流 — Agent 驱动 4 节点 LangGraph。
+
+    understand → research(迭代) → synthesize → user_review
+    """
+    return _run_graph_workflow(topic, "review")
+
+
+def run_research(topic):
+    """深度研究工作流 — Agent 驱动，无 user_review。"""
+    return _run_graph_workflow(topic, "research")
+
+
+def run_progress_report(topic):
+    """进展评估工作流 — Agent 驱动。"""
+    return _run_graph_workflow(topic, "progress_report")
+
+
+def _run_graph_workflow(topic: str, workflow_type: str):
+    """通用 LangGraph 工作流执行器。
+
+    4 节点 / 3 路径 / Agent 驱动。
+    """
     print_banner()
     storage = get_storage()
     if not storage:
@@ -696,71 +717,102 @@ def run_review(topic):
     username = user_manager.current_user.username
     checkpoint_db = str(BASE_DIR / "users" / username / "checkpoints.db")
 
-    def kb_search(t, limit=10):
-        retriever = _get_hr()(storage, username)
-        return retriever.search_papers(t, limit=limit)
-
-    def get_plan(t):
-        return storage.get_active_plan(t)
-
     graph = _get_graph()(checkpoint_db)
-    thread_id = f"review_{topic[:30]}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+    prefix = {"review": "review", "research": "research", "progress_report": "prog"}
+    thread_id = f"{prefix.get(workflow_type, 'wf')}_{topic[:20]}_{datetime.now().strftime('%Y%m%d_%H%M')}"
     config = {"configurable": {"thread_id": thread_id}}
-    set_runtime_context(thread_id,
-        _kb_search_func=kb_search, _get_plan_func=get_plan,
-        _storage=storage, _username=username,
-    )
-    initial_state = {"topic": topic, "additional_requirements": "", "messages": []}
-    print(f"\n[START] 启动文献综述: {topic}\n")
+    set_runtime_context(thread_id, _storage=storage, _username=username)
+
+    labels = {"review": "文献综述", "research": "深度研究", "progress_report": "进展评估"}
+    print(f"\n[START] 启动{labels.get(workflow_type, '工作流')}: {topic}\n")
 
     stage_labels = {
-        "understand_intent": "理解意图", "search_papers": "搜索论文(三路合流)",
-        "analyze_papers": "分层分析", "synthesize_review": "撰写综述",
-        "plan_research": "制定计划", "user_progress_input": "等待进展输入",
-        "assess_progress": "评估进展", "suggest_next": "下一步建议",
+        "understand": "📊 盘点现状 + 制定策略",
+        "research": "🔍 搜索分析",
+        "synthesize": "📝 综合撰写",
+        "user_review": "👤 人机审查",
     }
 
-    review_conclusion = ""
     try:
+        from langgraph.types import Command
+
         step = 0
-        for event in graph.stream(initial_state, config):
+        for event in graph.stream(
+            {"topic": topic, "workflow_type": workflow_type, "messages": []},
+            config,
+        ):
             step += 1
             node_name = list(event.keys())[0] if event else "unknown"
             node_data = event.get(node_name, {})
-            stage = node_data.get("current_stage", node_name)
-            print(f"\n{'='*60}")
-            print(f"  步骤 {step}: {stage_labels.get(stage, stage)}")
-            print(f"{'='*60}")
 
-            if stage == "search_papers":
+            # 处理 interrupt
+            if node_name == "__interrupt__":
+                interrupt_data = event.get("__interrupt__", [])
+                if interrupt_data:
+                    prompt = interrupt_data[0].value if hasattr(interrupt_data[0], 'value') else str(interrupt_data[0])
+                    print(f"\n{prompt}")
+                    user_input = input("  > ").strip()
+                    # 用 Command(resume=...) 继续
+                    for resume_event in graph.stream(Command(resume=user_input), config):
+                        rn = list(resume_event.keys())[0] if resume_event else "?"
+                        rd = resume_event.get(rn, {})
+                        if rd.get("output_approved"):
+                            print("\n✅ 已确认，工作流完成。")
+                        elif rd.get("user_feedback"):
+                            print(f"\n🔄 按反馈调整中...")
+                        stage = rd.get("current_stage", rn)
+                        if stage in stage_labels and stage != "user_review":
+                            print(f"  {stage_labels.get(stage, stage)}")
+                    break
+
+            stage = node_data.get("current_stage", node_name)
+            label = stage_labels.get(stage, stage)
+            print(f"\n{'─'*50}")
+            print(f"  {label}")
+            print(f"{'─'*50}")
+
+            if stage == "understand":
+                plan = node_data.get("search_plan", "")
+                if plan:
+                    print(f"  {plan[:400]}")
+            elif stage == "research":
                 papers = node_data.get("papers_found", [])
-                kb_n = sum(1 for p in papers if p.get("source_label") == "kb")
-                new_n = sum(1 for p in papers if p.get("source_label") == "new_search")
-                print(f"  找到: {len(papers)} 篇 (KB:{kb_n} 新搜索:{new_n})")
-            elif stage == "analyze_papers":
-                analyzed = node_data.get("analyzed_papers", [])
-                skipped = node_data.get("papers_skipped", [])
-                deep_n = sum(1 for a in analyzed if a.get("analysis_level") == "deep")
-                print(f"  深度:{deep_n} 轻量:{len(analyzed)-deep_n} 跳过:{len(skipped)}")
-            elif stage == "synthesize_review":
-                review_text = node_data.get("literature_review", "")
-                if review_text:
-                    # 取综述开头作为结论摘要（去除 markdown 标记）
-                    import re
-                    plain = re.sub(r"[#*>\-\n]+", " ", review_text[:600])
-                    plain = re.sub(r"\s+", " ", plain).strip()
-                    review_conclusion = plain[:300]
-                print(f"  综述字数: {node_data.get('review_word_count', 0)}")
-            elif stage == "user_progress_input":
-                print("\n  [NOTE] 请输入研究进展 (skip跳过 quit退出)")
+                it = node_data.get("search_iterations", 0)
+                satisfied = node_data.get("agent_satisfied", False)
+                print(f"  第{it}轮 | 累计: {len(papers)}篇 | {'✅ 满意' if satisfied else '🔄 继续'}")
+                if node_data.get("search_summary"):
+                    print(f"  {node_data['search_summary'][:300]}")
+            elif stage == "synthesize":
+                output = node_data.get("final_output", "")
+                cited = node_data.get("cited_papers", [])
+                if output and workflow_type != "review":
+                    # research 直接展示
+                    pass
+                print(f"  产出: {len(output)}字 | 引用: {len(cited)}篇")
+                if workflow_type == "research":
+                    print(f"\n{'='*60}")
+                    print(output)
+                    print(f"{'='*60}")
+
+        # 工作流完成后注入工作记忆（供后续 QA 讨论使用）
+        qa = get_qa()
+        if qa:
+            qa.working.add_turn(
+                question=f"用户请求{labels.get(workflow_type, '分析')}: {topic}",
+                answer=f"{labels.get(workflow_type, '分析')}已完成。",
+                cited_papers=[],
+                understanding=f"完成'{topic}'的{labels.get(workflow_type, '分析')}",
+            )
+
     except Exception as e:
         print(f"\n[ERROR] {e}")
         import traceback
         traceback.print_exc()
 
+    # 操作日志
     backup = get_backup()
     if backup:
-        backup.log_review(topic, 0, 0, 0, 0, conclusion=review_conclusion)
+        backup.log_review(topic, 0, 0, 0, 0, conclusion="")
 
 
 def _on_quit():

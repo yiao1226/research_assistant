@@ -54,7 +54,7 @@ class UserProgressEntry(TypedDict, total=False):
 
 
 class ResearchState(TypedDict, total=False):
-    """科研工作流完整状态。
+    """科研工作流完整状态 — Agent 驱动版（4节点）。
 
     LangGraph 在每个节点执行后自动通过 Checkpointer 持久化此状态。
     所有字段必须是 JSON 可序列化的。
@@ -62,37 +62,46 @@ class ResearchState(TypedDict, total=False):
 
     # === 用户输入 ===
     topic: str                               # 研究主题
-    research_goal: str                       # 研究目标（用户描述）
+    workflow_type: str                       # "review" / "research" / "progress_report"
+    research_goal: str                       # 研究目标（向后兼容）
     additional_requirements: str             # 额外要求
 
     # === 消息历史（LangGraph 标准字段） ===
     messages: Annotated[list, add_messages]   # 对话历史，自动追加
 
-    # === 文献搜索结果 ===
-    search_queries_used: list[str]            # 实际使用的搜索查询
-    papers_found: list[dict]                  # 搜索到的论文列表
-    search_status: str                        # "success" / "partial" / "failed"
+    # === 搜索阶段（新） ===
+    search_plan: str                         # understand 节点产出的搜索策略
+    papers_found: list[dict]                  # 搜索到的论文列表（跨轮累积）
+    search_iterations: int                   # 当前搜索轮次
+    agent_satisfied: bool                    # Agent 是否满意搜索结果
+    search_summary: str                      # Agent 搜索评估摘要
+    search_queries_used: list[str]            # 向后兼容
+    search_status: str                        # 向后兼容
 
-    # === 论文分析 ===
-    analyzed_papers: list[dict]              # 深度分析后的论文
-    papers_skipped: list[str]                 # 跳过的论文及原因
+    # === 论文分析（向后兼容） ===
+    analyzed_papers: list[dict]
+    papers_skipped: list[str]
 
-    # === 综述撰写 ===
-    literature_review: str                   # 生成的文献综述 Markdown
-    review_word_count: int
+    # === 综合输出（新） ===
+    final_output: str                        # 最终产出（综述/回答/报告）
+    cited_papers: list[dict]                 # 引用的论文列表
+    literature_review: str                   # 向后兼容
+    review_word_count: int                   # 向后兼容
+
+    # === 人机协同（新） ===
+    user_feedback: str                       # user_review 节点输入
+    output_approved: bool                    # 用户确认通过
 
     # === 研究计划 ===
-    research_plan: str                       # 助手建议的研究计划
-    suggested_experiments: list[str]         # 建议的实验方向
+    research_plan: str
+    suggested_experiments: list[str]
 
-    # === 用户自身进展（关键！） ===
-    user_progress_entries: list[dict]        # 用户输入的进展记录
-    pending_user_input: Optional[str]        # 等待用户输入时的提示信息
-
-    # === 进展评估 ===
-    progress_report: str                     # 进展报告
-    knowledge_gaps: list[str]                # 知识缺口
-    next_step_suggestions: list[str]         # 下一步建议
+    # === 进展记录 ===
+    user_progress_entries: list[dict]
+    pending_user_input: Optional[str]
+    progress_report: str
+    knowledge_gaps: list[str]
+    next_step_suggestions: list[str]
 
     # === 元数据 ===
     current_stage: str                       # 当前工作流阶段

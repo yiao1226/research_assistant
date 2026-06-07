@@ -1,30 +1,35 @@
-"""智能问答服务 — 意图识别 → 按需检索 → 自适应回答。
+"""智能问答服务 — Agent + 工具调用，替代固定意图路由。
 
-流程:
-  Phase 1: LLM 意图识别 (每次1次调用, ~0.3s)
-    输入: 工作记忆 + 进展摘要 + 未解决问题 + 用户输入
-    输出: intent(chat|research|direction) + keywords + understanding
+架构变化:
+  旧: 输入 → LLM 分类(chat/recall/research/direction) → 固定分支 → 回答
+  新: 输入 → LLM + 4 工具 → 自主决策调哪些/怎么组合 → 回答
 
-  Phase 2:
-    chat      → Phase1 已给出回答，直接返回
-    research  → 检索论文/进展/图谱 → LLM 生成回答
-    direction → 同上 + 提取后续科研方向 + 可记录到progress
+为什么改:
+  1. 意图识别是穷人的 tool choice — LLM 被当分类器用，选完走死分支
+  2. recall/research/direction 边界模糊，混合场景无法处理
+  3. 固定分支意味着每次都要写新的 if-else，而工具调用让 LLM 自己组合
+  4. LLM 调用次数没省 (旧: 2-3次, 新: 1+N次按需)
 
-三种意图自适应输出:
-  chat:     简短, 无引用, 无方向
-  research: 有据可查, 标注引用, 无方向
-  direction: 有据可查, 标注引用, 2-3个后续方向
+工具清单:
+  - query_knowledge_base: 本地论文库语义检索 (Hybrid: BM25 + Dense + RRF)
+  - query_progress: 用户研究进展记录查询
+  - recall_history: 情景记忆/历史会话检索 (语义×时间衰减)
+  - search_papers_online: 外部论文搜索 (ArXiv/Semantic Scholar)
+
+保留:
+  - 工作记忆 (WorkingMemory) 集成 — 多轮对话上下文
+  - 用户画像被动注入 — 每次回答前注入 user_facts.json
+  - 会话管理 (end_session / get_stats)
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime
-from typing import Optional
+from collections import OrderedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
-from ..utils import get_llm, extract_json_from_llm_response
+from ..utils import get_llm
 from ..core.storage import PerUserStorage
 from ..rag.retrieval import HybridRetriever
 from ..memory.working import WorkingMemory
@@ -32,100 +37,52 @@ from ..memory.working import WorkingMemory
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# Prompt 模板
+# Agent 系统提示词
 # ============================================================
 
-INTENT_PROMPT = """你是科研助手的意图识别模块。
+AGENT_SYSTEM_PROMPT = """你是科研助手，帮助用户进行学术研究。你有以下工具可以调用:
 
-## 四种意图
-- chat: 闲聊、问候、概念解释，不需要检索任何数据
-- recall: 用户询问历史/过去的讨论内容，需要检索情景记忆
-- research: 需要查论文/进展/知识图谱才能回答的科研问题
-- direction: 科研问题 + 用户想知道后续方向/下一步怎么做
+## 工具说明
 
-## 判断规则（优先级从高到低）
-1. 问候/寒暄/自我介绍/感谢/再见 → chat
-2. 简单概念解释（什么是XX、XX的定义）→ chat
-3. 询问过去讨论的内容（"上次讨论了什么""之前聊过XX""还记得XX吗""回顾一下XX"）→ recall
-4. 需要查论文才能回答的科研问题 + 明确说"下一步/后续/接下来/建议方向" → direction
-5. 需要查论文才能回答的科研问题 → research
+1. **query_knowledge_base(query, limit)** — 搜索本地论文知识库
+   适用场景: 用户问科研问题、需要查论文数据、想知道某个领域的研究进展
+   返回: 匹配的论文片段（含标题、核心结论、匹配内容）
 
-## keywords 提取规则
-- 从用户问题中提取**具体术语**作为检索词
-- recall: 提取用户想回顾的主题词（"上次讨论的CVD温度" → ["CVD", "温度"]）
-- research/direction: 提取学术术语，含中英文同义词
-- 中文学术论文常用词: 结论、工艺、参数、最佳、最优、影响、分析
+2. **query_progress(query, limit)** — 查询用户的研究进展记录
+   适用场景: 用户问"我做过什么实验"、"进展如何"、"之前记录了哪些"
+   返回: 相关的实验/阅读/想法记录
+
+3. **recall_history(query, limit)** — 搜索历史会话讨论
+   适用场景: 用户问"上次讨论了什么"、"之前分析过XX"、"还记得吗"
+   返回: 历史会话摘要和关键讨论
+
+4. **search_papers_online(query)** — 从外部搜索新论文
+   适用场景: 用户想找最新的论文、"搜索一下XX"、"有没有关于XX的新研究"
+   返回: 外部搜索到的论文列表
+
+## 决策原则
+
+- 问候/闲聊/概念解释: 不调工具，直接友好回答
+- 科研问题(需要数据支撑): 先调 query_knowledge_base，不够再调其他
+- 回忆历史: 调 recall_history
+- 找新论文/外部搜索: 调 search_papers_online
+- 可以组合调用多个工具，比如同时查论文和进展
+- 工具返回无结果时诚实告知，不要编造数据
+
+## 回答格式
+
+- 基于工具返回的真实内容回答，引用论文用 [论文标题] 标注
+- 包含具体数值、参数、指标（如果工具返回里有的话）
+- 如果工具返回了论文，在末尾列出引用的论文
+- 中文回答，学术风格但可读
 
 ## 背景上下文
-{context}
 
-## 用户输入
-{question}
-
-## 输出 JSON
-{{
-  "intent": "chat|recall|research|direction",
-  "keywords": ["检索词"],
-  "understanding": "意图理解（1句话）",
-  "answer": "chat时直接回答（1-3句），其他时留空"
-}}
-
-只返回 JSON。"""
-
-RESEARCH_ANSWER_PROMPT = """你是科研助手，基于检索结果回答用户问题。
-
-## 用户意图
-{understanding}
-
-## 对话上下文
-{working_context}
-
-## 检索到的论文
-{papers_text}
-
-## 相关实验进展
-{progress_text}
-
-## 知识图谱
-{kg_text}
-
-## 历史相关讨论
-{episodic_text}
-
-## 用户问题
-{question}
-
-## 回答要求
-- 从"匹配内容"中提取**具体定量信息**（数值、参数、指标、性能数据等），不要只说"未提供"
-- 回答基于检索结果，不凭空编造，不推断缺失的数据
-- 引用论文时用 [论文N] 标注
-- 如果有矛盾信息，明确指出
-- {direction_hint}
-
-用 Markdown 格式输出。"""
-
-DIRECTION_EXTRACT_PROMPT = """从以下回答中提取 2-3 个后续科研方向。
-
-回答:
-{answer}
-
-输出 JSON:
-{{
-  "directions": [
-    {{
-      "title": "方向简述(<30字)",
-      "description": "具体描述(1句话)",
-      "priority": "high|medium|low",
-      "suggested_action": "建议的具体行动"
-    }}
-  ]
-}}
-
-只返回 JSON。"""
+{context}"""
 
 
 class QAService:
-    """智能问答服务。"""
+    """智能问答服务 — Agent 驱动，工具自主调用。"""
 
     def __init__(self, username: str, storage: PerUserStorage):
         self.username = username
@@ -135,143 +92,212 @@ class QAService:
 
     # ── 主入口 ──
 
-    def ask(self, question: str, record_directions: bool = True) -> dict:
-        """执行智能问答。
+    def ask(self, question: str) -> dict:
+        """Agent 循环: LLM + 工具自主调用。
 
         Returns:
-            {"intent": str, "answer": str, "cited_papers": [...],
-             "directions": [...], "progress_recorded": bool}
+            {"answer": str, "cited_papers": [...], "tool_calls": [...]}
         """
-        # === Phase 1: 意图识别 ===
-        intent_result = self._recognize_intent(question)
+        # 构建工具（闭包捕获 self）
+        tools = self._build_tools()
 
-        intent = intent_result["intent"]
-        understanding = intent_result.get("understanding", "")
+        # 构建上下文（用户画像 + 工作记忆 + 进展摘要）
+        context = self._build_context()
 
-        # === 按意图路由检索 ===
-        keywords = intent_result.get("keywords", [question])
+        # Agent 循环
+        llm = get_llm(temperature=0.3, max_tokens=2048)
+        llm_with_tools = llm.bind_tools(tools)
 
-        if intent == "chat":
-            # 闲聊：不检索，直接回答
-            answer = intent_result.get("answer", "")
-            if not answer:
-                answer = self._chat_answer(question, understanding)
-            self.working.add_turn(question, answer, [], understanding)
-            return {
-                "intent": "chat",
-                "answer": answer,
-                "cited_papers": [],
-                "directions": [],
-                "progress_recorded": False,
-            }
+        messages = [
+            SystemMessage(content=AGENT_SYSTEM_PROMPT.format(context=context)),
+            HumanMessage(content=question),
+        ]
 
-        if intent == "recall":
-            # 回忆：只检索情景记忆，不检索论文/进展/图谱
-            episodic_context = self._retrieve_episodic(keywords)
-            answer = self._recall_answer(question, understanding, episodic_context)
-            self.working.add_turn(question, answer, [], understanding)
-            return {
-                "intent": "recall",
-                "answer": answer,
-                "cited_papers": [],
-                "directions": [],
-                "progress_recorded": False,
-            }
+        tool_calls_log = []
+        cited_papers = []
 
-        # === research / direction: 全检索 ===
-        papers = self._retrieve_papers(keywords)
-        progress = self._retrieve_progress(keywords)
-        kg = self._retrieve_knowledge_graph(keywords)
+        # 最多 3 轮工具调用（防止死循环）
+        for _ in range(3):
+            response = llm_with_tools.invoke(messages)
 
-        # 情景记忆
-        if intent == "direction":
-            episodic_context = self._retrieve_episodic(keywords)
-        else:
-            episodic_context = self._retrieve_episodic(keywords) if len(papers) < 3 else ""
+            # 无工具调用 → LLM 直接回答 → 结束
+            if not (hasattr(response, 'tool_calls') and response.tool_calls):
+                messages.append(response)
+                break
 
-        # 构建回答
-        direction_flag = (intent == "direction")
-        answer = self._generate_answer(
-            question=question,
-            understanding=understanding,
-            papers=papers,
-            progress=progress,
-            kg=kg,
-            episodic_context=episodic_context,
-            with_direction=direction_flag,
-        )
+            # 有工具调用 → 执行 → 结果反馈
+            messages.append(response)
+            for tc in response.tool_calls:
+                tool_name = tc.get("name", "unknown")
+                tool_args = tc.get("args", {})
+                tool_id = tc.get("id", "")
 
-        # 提取引用
-        cited = self._extract_cited_papers(answer, papers)
+                logger.info(
+                    "Agent 调用工具: %s(%s)", tool_name,
+                    {k: str(v)[:80] for k, v in tool_args.items()},
+                )
+
+                # 执行工具
+                tool_result = self._execute_tool(tool_name, tool_args, tools)
+                tool_calls_log.append({
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result_len": len(str(tool_result)),
+                })
+
+                # 收集引用的论文
+                if tool_name == "query_knowledge_base":
+                    cited_papers.extend(
+                        self._extract_cited_from_result(tool_result)
+                    )
+
+                messages.append(ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=tool_id,
+                ))
+
+        # 提取最终回答
+        final_msg = messages[-1]
+        answer = str(final_msg.content) if hasattr(final_msg, 'content') else ""
 
         # 更新工作记忆
-        self.working.add_turn(question, answer, cited, understanding)
-
-        # 提取方向
-        directions = []
-        progress_recorded = False
-        if direction_flag:
-            directions = self._extract_directions(answer)
-            if record_directions and directions:
-                progress_recorded = self._record_directions(question, directions)
+        self.working.add_turn(question, answer, cited_papers, "")
 
         return {
-            "intent": intent,
             "answer": answer,
-            "cited_papers": cited,
-            "directions": directions,
-            "progress_recorded": progress_recorded,
+            "cited_papers": cited_papers,
+            "tool_calls": tool_calls_log,
         }
 
-    # ── Phase 1: 意图识别 ──
+    # ── 工具构建 ──
 
-    def _recognize_intent(self, question: str) -> dict:
-        """LLM 语义识别意图。所有输入都走 LLM，不硬编码规则。"""
+    def _build_tools(self) -> list:
+        """构建 Agent 可调用的工具列表（闭包捕获 self）。"""
+        _self = self
 
-        context = self._build_intent_context()
-        llm = get_llm(temperature=0.1, max_tokens=256)
+        @tool
+        def query_knowledge_base(query: str, limit: int = 5) -> str:
+            """搜索本地论文知识库。用来回答科研问题、查找论文中的具体参数/方法/结论。
 
-        try:
-            response = llm.invoke([
-                SystemMessage(content="你是意图识别模块。只返回 JSON。"),
-                HumanMessage(content=INTENT_PROMPT.format(
-                    context=context, question=question,
-                )),
-            ])
-            result = extract_json_from_llm_response(str(response.content))
-            return {
-                "intent": result.get("intent", "chat"),
-                "keywords": result.get("keywords", []),
-                "understanding": result.get("understanding", ""),
-                "answer": result.get("answer", ""),
-            }
-        except Exception:
-            logger.debug("意图识别失败，降级为 chat", exc_info=True)
-            return {
-                "intent": "chat",
-                "keywords": [],
-                "understanding": "",
-                "answer": "",
-            }
+            Args:
+                query: 搜索关键词（建议用学术术语，如 "CVD温度优化" "钙钛矿PLQY"）
+                limit: 返回结果数，默认5
+            """
+            papers = _self._retrieve_papers(
+                [query], limit=limit, use_expansion=True,
+            )
+            if not papers:
+                return "（未在本地知识库中找到相关论文）"
+            return _self._format_papers_for_llm(papers)
 
-    def _build_intent_context(self) -> str:
-        """构建 Phase 1 的上下文（不含检索结果）。
+        @tool
+        def query_progress(query: str, limit: int = 5) -> str:
+            """查询用户的研究进展记录。用来回答"我做过什么实验""有什么进展""记录了哪些想法"。
 
-        改进: 注入用户画像（被动注入机制，参考 DeerFlow DynamicContextMiddleware）。
+            Args:
+                query: 搜索关键词
+                limit: 返回结果数，默认5
+            """
+            results = _self._retrieve_progress([query], limit=limit)
+            if not results:
+                return "（未找到相关进展记录）"
+            return _self._format_progress_for_llm(results)
+
+        @tool
+        def recall_history(query: str, limit: int = 3) -> str:
+            """搜索历史会话和讨论记录。用来回答"上次讨论了XX""之前分析过YY""还记得吗"。
+
+            Args:
+                query: 搜索关键词（提取你想回顾的主题词）
+                limit: 返回结果数，默认3
+            """
+            results = _self._retrieve_episodic([query])
+            if not results:
+                return "（未找到相关历史讨论记录）"
+            # 截取前 limit 条
+            parts = results.strip().split("\n- [")
+            if len(parts) > limit:
+                results = "\n- [".join(parts[:limit + 1])
+            return results
+
+        @tool
+        def search_papers_online(query: str) -> str:
+            """从外部学术平台搜索新论文（ArXiv + Semantic Scholar）。
+            用来回答"找一下XX的最新论文""搜索XX领域""有没有关于XX的研究"。
+
+            Args:
+                query: 搜索关键词（英文效果更好，如 "diamond CVD temperature optimization"）
+            """
+            try:
+                from ..tools.search_orchestrator import SearchOrchestrator
+                orch = SearchOrchestrator(_self.storage, _self.username)
+                result = orch.search(query, sources=["arxiv", "s2"])
+                papers = result.get("papers", [])
+                if not papers:
+                    return (
+                        f"（外部搜索未找到相关论文。搜索策略: "
+                        f"{result.get('search_focus', '')}）"
+                    )
+                lines = [
+                    f"外部搜索: 找到 {result.get('total_found', 0)} 篇, "
+                    f"精选 Top-{len(papers)}, 耗时 {result.get('duration_sec', 0):.1f}s\n",
+                ]
+                for i, p in enumerate(papers[:5], 1):
+                    lines.append(
+                        f"[{i}] {p.get('title', '?')}\n"
+                        f"    评分: {p.get('composite_score', 0):.0f}/100 | "
+                        f"引用: {p.get('citation_count', 0) or 0} | "
+                        f"年份: {p.get('year', '')}\n"
+                        f"    核心: {p.get('core_contribution', '')[:200]}\n"
+                        f"    摘要: {(p.get('abstract', '') or '')[:300]}"
+                    )
+                return "\n".join(lines)
+            except Exception:
+                logger.debug("外部搜索失败", exc_info=True)
+                return "（外部搜索暂时不可用，请稍后重试）"
+
+        return [
+            query_knowledge_base,
+            query_progress,
+            recall_history,
+            search_papers_online,
+        ]
+
+    def _execute_tool(self, name: str, args: dict, tools: list) -> str:
+        """执行工具调用并返回结果文本。"""
+        for t in tools:
+            if t.name == name:
+                try:
+                    result = t.invoke(args)
+                    return str(result) if result else "（工具返回空结果）"
+                except Exception as e:
+                    logger.warning("工具 %s 执行失败: %s", name, e)
+                    return f"（工具执行失败: {e}）"
+        return f"（未知工具: {name}）"
+
+    # ── 上下文构建 ──
+
+    def _build_context(self) -> str:
+        """构建 Agent 上下文（注入用户画像 + 工作记忆 + 进展摘要）。
+
+        替代旧的 _build_intent_context() — 内容相同但不再为"意图识别"服务，
+        而是作为 Agent 的背景知识，帮助它更好地理解用户问题。
         """
         parts = []
 
-        # ── 用户画像（新增：被动注入）──
+        # 用户画像（被动注入）
         try:
             from ..memory.user_profile import UserProfileManager
-            profile_mgr = UserProfileManager(self.username, str(self.storage.user_dir))
+            profile_mgr = UserProfileManager(
+                self.username, str(self.storage.user_dir),
+            )
             profile_text = profile_mgr.build_context_for_qa()
             if profile_text:
                 parts.append(profile_text)
         except Exception:
             logger.debug("用户画像注入跳过", exc_info=True)
 
-        # 工作记忆
+        # 工作记忆（最近 3 轮对话）
         wm = self.working.get_context(3)
         if wm:
             parts.append(f"## 最近对话\n{wm}")
@@ -280,12 +306,13 @@ class QAService:
         try:
             progress = self.storage.get_all_progress(limit=5)
             if progress:
-                parts.append("## 用户研究进展")
+                lines = ["## 用户研究进展"]
                 for p in progress:
-                    parts.append(
-                        f"- [{p.get('entry_type','?')}] {p.get('title','')}: "
-                        f"{p.get('insights','') or p.get('content','')[:80]}"
+                    lines.append(
+                        f"- [{p.get('entry_type', '?')}] {p.get('title', '')}: "
+                        f"{p.get('insights', '') or p.get('content', '')[:80]}"
                     )
+                parts.append("\n".join(lines))
         except Exception:
             pass
 
@@ -295,24 +322,25 @@ class QAService:
             em = EpisodicMemory(self.storage, self.username)
             unresolved = em.get_unresolved_questions(limit=3)
             if unresolved:
-                parts.append("## 上次未解决问题")
+                lines = ["## 上次未解决问题"]
                 for q in unresolved:
-                    parts.append(f"- {q}")
+                    lines.append(f"- {q}")
+                parts.append("\n".join(lines))
         except Exception:
             pass
 
         return "\n\n".join(parts) if parts else "（首次对话，无语境上下文）"
 
-    # ── 检索子模块 ──
+    # ── 检索子模块（工具实现）──
 
     def _retrieve_papers(self, keywords: list[str],
-                          limit: int = 10, use_expansion: bool = True) -> list[dict]:
+                         limit: int = 10, use_expansion: bool = True) -> list[dict]:
+        """MQE + HyDE 扩展检索本地论文库。"""
         query = " ".join(keywords) if keywords else ""
         if not query:
             return []
         try:
             if use_expansion:
-                # MQE + HyDE 扩展检索
                 return self.retriever.search_papers_expanded(
                     query, limit=limit,
                     enable_mqe=True, mqe_expansions=3,
@@ -324,7 +352,8 @@ class QAService:
             return []
 
     def _retrieve_progress(self, keywords: list[str],
-                            limit: int = 5) -> list[dict]:
+                           limit: int = 5) -> list[dict]:
+        """检索用户研究进展记录。"""
         query = " ".join(keywords) if keywords else ""
         if not query:
             return []
@@ -334,77 +363,24 @@ class QAService:
             logger.debug("进展检索失败", exc_info=True)
             return []
 
-    def _retrieve_knowledge_graph(self, keywords: list[str]) -> list[str]:
-        try:
-            from ..memory.semantic import SemanticMemory
-            sm = SemanticMemory(self.username)
-            if not sm.available:
-                sm.close()
-                return []
-            results = []
-            for kw in keywords[:3]:
-                if len(kw) < 2:
-                    continue
-                neighbors = sm.search_entity(kw)
-                for n in neighbors[:3]:
-                    results.append(
-                        f"[{n.get('type','')}] {n.get('entity','')} "
-                        f"--({n.get('relation','')})--"
-                    )
-            sm.close()
-            return results[:10]
-        except Exception:
-            logger.debug("图谱检索失败", exc_info=True)
-            return []
-
-    def _recall_answer(self, question: str, understanding: str,
-                        episodic_context: str) -> str:
-        """基于情景记忆检索结果回答历史相关问题。
-
-        仅检索情景记忆，不检索论文/进展/图谱，避免无意义检索。
-        """
-        if not episodic_context:
-            return (
-                "抱歉，我暂时没有找到相关的历史讨论记录。"
-                "你可以尝试用 recall 命令搜索，或告诉我具体的主题帮"
-                "我定位。"
-            )
-        try:
-            llm = get_llm(temperature=0.3, max_tokens=512)
-            prompt = (
-                f"用户问: {question}\n\n"
-                f"意图: {understanding}\n\n"
-                f"以下是之前会话中相关的讨论记录（按语义相关度和时间排序）:\n"
-                f"{episodic_context}\n\n"
-                f"请基于这些历史记录回答用户的问题。"
-                f"如果记录不足以完整回答，请诚实告知。"
-            )
-            response = llm.invoke([
-                SystemMessage(content="你是科研助手。基于历史记录回答用户关于过往讨论的问题。"),
-                HumanMessage(content=prompt),
-            ])
-            return str(response.content).strip()
-        except Exception:
-            return "抱歉，检索历史讨论时出现错误。请稍后重试。"
-
     def _retrieve_episodic(self, keywords: list[str]) -> str:
-        """检索相关历史会话摘要（语义相似度 × 时间衰减）。
-
-        仅在 direction 意图和 papers 不足时调用。
-        使用 recall_context_hybrid 混合检索，
-        新近讨论权重更高。
-        """
+        """检索情景记忆（语义相似度 × 时间衰减）。"""
         query = " ".join(keywords) if keywords else ""
         if not query:
             return ""
         try:
             from ..memory.episodic import EpisodicMemory
             em = EpisodicMemory(self.storage, self.username)
-            results = em.recall_context_hybrid(query, limit=3, decay_days=30.0)
+            results = em.recall_context_hybrid(
+                query, limit=3, decay_days=30.0,
+            )
             if results:
                 parts = []
                 for r in results:
-                    text = (r.get("text", "") or r.get("payload", {}).get("text", ""))[:150]
+                    text = (
+                        r.get("text", "") or
+                        r.get("payload", {}).get("text", "")
+                    )[:150]
                     date_str = r.get("payload", {}).get("session_date", "")
                     if text:
                         parts.append(f"- [{date_str}] {text}")
@@ -413,186 +389,90 @@ class QAService:
             logger.debug("情景记忆检索失败", exc_info=True)
         return ""
 
-    def _chat_answer(self, question: str, context_hint: str = "") -> str:
-        """生成简短闲聊回答（不检索）。"""
-        try:
-            llm = get_llm(temperature=0.5, max_tokens=128)
-            prompt = f"用户说: {question}\n请简短友好地回复(1-2句话)，介绍自己是科研助手。"
-            response = llm.invoke([
-                SystemMessage(content="你是友好的科研助手。回复简短自然。"),
-                HumanMessage(content=prompt),
-            ])
-            return str(response.content).strip()
-        except Exception:
-            return "你好！我是科研助手，可以帮你检索知识库论文、解答科研问题。有什么需要？"
+    # ── 工具结果格式化 ──
 
-    # ── Phase 2: 生成回答 ──
+    def _format_papers_for_llm(self, papers: list[dict]) -> str:
+        """将检索到的论文格式化为 LLM 友好的 Markdown 文本。
 
-    def _generate_answer(self, question: str, understanding: str,
-                          papers: list[dict], progress: list[dict],
-                          kg: list[str], with_direction: bool,
-                          episodic_context: str = "") -> str:
-        """LLM 基于检索结果生成回答。
-
-        Args:
-            episodic_context: 情景记忆混合检索结果（语义×时间），仅
-                direction 意图和 papers 不足时传入。
+        按 paper_id 分组，同篇论文的不同 chunk 归入同一编号。
         """
-        direction_hint = (
-            "最后给出 2-3 个具体的后续科研方向"
-            if with_direction else
-            "不需要给出后续方向"
-        )
+        if not papers:
+            return "（未检索到相关论文）"
 
-        # 构建论文文本：按论文分组，同篇论文的不同章节归入同一编号
-        if papers:
-            from collections import OrderedDict
-            paper_groups = OrderedDict()
-            for p in papers:
-                pid = str(p.get("paper_id") or p.get("id", ""))
-                if not pid:
-                    continue
-                text = (p.get("text", "") or "")
-                payload = p.get("payload", {})
-                if not text and isinstance(payload, dict):
-                    text = payload.get("text", "") or payload.get("window_text", "")
-                if not text:
-                    continue  # 跳过空文本结果（BM25 降级等情况）
-                if pid not in paper_groups:
-                    paper_groups[pid] = {
-                        "title": p.get("title", ""),
-                        "abstract": (p.get("abstract", "") or "")[:150],
-                        "core": p.get("core_claim", ""),
-                        "chunks": [],
-                    }
-                # 后续结果可能补全 title
-                if not paper_groups[pid]["title"] and p.get("title"):
-                    paper_groups[pid]["title"] = p.get("title")
-                if not paper_groups[pid]["core"] and p.get("core_claim"):
-                    paper_groups[pid]["core"] = p.get("core_claim")
-                paper_groups[pid]["chunks"].append({
-                    "heading": p.get("heading_path", ""),
-                    "text": text[:800],
-                })
-
-            paper_items = list(paper_groups.items())[:5]
-            parts = []
-            for i, (pid, pinfo) in enumerate(paper_items):
-                title = pinfo["title"] or "?"
-                parts.append(f"[论文{i+1}] {title}")
-                if pinfo["abstract"]:
-                    parts.append(f"  摘要: {pinfo['abstract']}")
-                if pinfo["core"]:
-                    parts.append(f"  核心结论: {pinfo['core']}")
-                for chunk in pinfo["chunks"][:3]:
-                    hp = f" ({chunk['heading']})" if chunk["heading"] else ""
-                    parts.append(f"  匹配内容{hp}: {chunk['text']}")
-            papers_text = "\n\n".join(parts)
-        else:
-            papers_text = "（未检索到相关论文）"
-
-        # 进展
-        if progress:
-            progress_text = "\n".join(
-                f"- [{p.get('entry_type','?')}] {p.get('title','')}: "
-                f"{(p.get('content','') or p.get('insights','') or '')[:150]}"
-                for p in progress[:5]
-            )
-        else:
-            progress_text = "（无相关进展记录）"
-
-        # 知识图谱
-        kg_text = "\n".join(f"- {r}" for r in kg) if kg else "（无相关图谱数据）"
-
-        # 工作记忆
-        wm_ctx = self.working.get_context(2)
-
-        llm = get_llm(temperature=0.3, max_tokens=2048)
-
-        prompt = RESEARCH_ANSWER_PROMPT.format(
-            understanding=understanding,
-            working_context=wm_ctx or "（无最近对话）",
-            papers_text=papers_text,
-            progress_text=progress_text,
-            kg_text=kg_text,
-            episodic_text=episodic_context or "（无相关历史讨论）",
-            question=question,
-            direction_hint=direction_hint,
-        )
-
-        try:
-            response = llm.invoke([
-                SystemMessage(content="你是科研助手。基于检索结果回答，引用论文标注 [论文N]。"),
-                HumanMessage(content=prompt),
-            ])
-            return str(response.content).strip()
-        except Exception:
-            logger.error("回答生成失败", exc_info=True)
-            return "抱歉，回答生成失败。请稍后重试。"
-
-    # ── 后处理 ──
-
-    def _extract_cited_papers(self, answer: str,
-                               papers: list[dict]) -> list[dict]:
-        """按 paper_id 去重后，匹配 answer 中的 [论文N] 引用。"""
-        # 与 _generate_answer 相同的分组顺序
-        from collections import OrderedDict
+        # 按 paper_id 分组
         groups = OrderedDict()
         for p in papers:
             pid = str(p.get("paper_id") or p.get("id", ""))
             if not pid:
                 continue
-            if pid not in groups or (not groups[pid].get("title") and p.get("title")):
-                groups[pid] = p
-        cited = []
-        for i, (pid, p) in enumerate(groups.items()):
-            if f"[论文{i+1}]" in answer:
-                cited.append(p)
-        return cited
+            text = (p.get("text", "") or
+                    p.get("payload", {}).get("text", "") or
+                    p.get("payload", {}).get("window_text", ""))
+            if not text:
+                continue
+            if pid not in groups:
+                groups[pid] = {
+                    "title": p.get("title", ""),
+                    "abstract": (p.get("abstract", "") or "")[:150],
+                    "core": p.get("core_claim", ""),
+                    "chunks": [],
+                }
+            if not groups[pid]["title"] and p.get("title"):
+                groups[pid]["title"] = p.get("title")
+            if not groups[pid]["core"] and p.get("core_claim"):
+                groups[pid]["core"] = p.get("core_claim")
+            groups[pid]["chunks"].append({
+                "heading": p.get("heading_path", ""),
+                "text": text[:800],
+            })
 
-    def _extract_directions(self, answer: str) -> list[dict]:
-        try:
-            llm = get_llm(temperature=0.1, max_tokens=512)
-            response = llm.invoke([
-                SystemMessage(content="你是科研方向提取专家。只返回 JSON。"),
-                HumanMessage(content=DIRECTION_EXTRACT_PROMPT.format(
-                    answer=answer[:3000]
-                )),
-            ])
-            result = extract_json_from_llm_response(str(response.content))
-            return result.get("directions", [])
-        except Exception:
-            logger.debug("方向提取失败", exc_info=True)
-            return []
+        # 限制总 Token（最多 5 篇论文，每篇 3 个 chunk）
+        items = list(groups.items())[:5]
+        lines = []
+        for i, (pid, info) in enumerate(items):
+            title = info["title"] or "?"
+            lines.append(f"\n### [论文{i + 1}] {title}")
+            if info["abstract"]:
+                lines.append(f"摘要: {info['abstract']}")
+            if info["core"]:
+                lines.append(f"核心结论: {info['core']}")
+            for chunk in info["chunks"][:3]:
+                hp = f" ({chunk['heading']})" if chunk["heading"] else ""
+                lines.append(f"匹配内容{hp}: {chunk['text']}")
 
-    def _record_directions(self, question: str,
-                            directions: list[dict]) -> bool:
-        try:
-            from ..tools.progress import record_user_progress
-            for d in directions:
-                title = d.get("title", "未命名")
-                content = (
-                    f"[来源: Q&A] 问题: {question[:100]}\n"
-                    f"{d.get('description','')}\n"
-                    f"建议行动: {d.get('suggested_action','')}"
-                )
-                record_user_progress.invoke({
-                    "topic": title,
-                    "entry_type": "idea",
-                    "title": title,
-                    "content": content,
-                    "results": d.get("suggested_action", ""),
-                    "insights": d.get("description", ""),
-                    "timestamp": datetime.now().isoformat(),
-                })
-            return True
-        except Exception:
-            logger.debug("progress 记录失败", exc_info=True)
-            return False
+        return "\n".join(lines)
+
+    def _format_progress_for_llm(self, entries: list[dict]) -> str:
+        """格式化进展记录为文本。"""
+        lines = []
+        for i, p in enumerate(entries[:5], 1):
+            payload = p.get("payload", {})
+            title = payload.get("title", p.get("title", "?"))
+            content = (
+                payload.get("content", "") or
+                payload.get("text", "") or
+                p.get("text", "")
+            )[:200]
+            entry_type = payload.get("entry_type", p.get("type", "?"))
+            lines.append(f"[{i}] [{entry_type}] {title}: {content}")
+        return "\n".join(lines) if lines else "（无相关进展记录）"
+
+    def _extract_cited_from_result(self, tool_result: str) -> list[dict]:
+        """从工具返回文本中提取论文引用信息。"""
+        papers = []
+        # 简单解析: 匹配 [论文N] 标记
+        import re
+        for m in re.finditer(r'\[论文(\d+)\]\s+(.+)', tool_result):
+            papers.append({
+                "index": int(m.group(1)),
+                "title": m.group(2)[:100],
+            })
+        return papers
 
     # ── 会话管理 ──
 
     def end_session(self):
+        """结束会话: 刷盘事实 + 生成摘要。"""
         summary = self.working.get_session_summary()
         try:
             from ..memory.episodic import EpisodicMemory
@@ -603,4 +483,5 @@ class QAService:
         self.working.clear()
 
     def get_stats(self) -> dict:
+        """获取会话统计。"""
         return {"working_memory": self.working.stats()}
