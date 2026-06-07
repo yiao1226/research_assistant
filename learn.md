@@ -323,3 +323,145 @@ combined_score = semantic_score × e^(-days_ago / 30)
 ### 3.11 已有事实摘要的作用
 
 LLM 提取事实时传入已有事实列表，让 LLM 判断"这条是不是已经知道了"。已有的事实不会重复提取，省 API 成本 + 避免 user_facts.json 膨胀。
+
+---
+
+## 四、RAG 管道
+
+### 4.1 检索全景图
+
+```
+query_knowledge_base("金刚石CVD温度优化")
+  │
+  ▼
+HybridRetriever.search_papers_expanded()
+  │
+  ├─ ① 查询扩展 (MQE + HyDE)
+  │   原始查询 → 3个语义变体 + 1段假设答案
+  │
+  ├─ ② 对每个扩展查询并行执行 search_papers()
+  │   │
+  │   ├─ BM25: chunk 级索引（元数据分句+关键词）→ jieba 分词 → 关键词匹配
+  │   ├─ Dense: BGE嵌入(512维) → Qdrant句子级向量检索 → 句子窗口替换
+  │   ├─ SQLite: FTS5全文索引 → 关键词直搜
+  │   └─ RRF三路融合 (BM25 + Dense + SQLite) → heading_path加权 → 去重
+  │
+  ├─ ③ MRR合并: 多个扩展查询 → 累计MRR分数排序
+  │
+  └─ ④ 后处理: dedup_by_paper → top-k 返回
+```
+
+### 4.2 BM25 — chunk 级关键词匹配（重构后）
+
+文件：[retrieval.py:73-175](research_assistant/rag/retrieval.py#L73-L175)
+
+**旧版问题**：BM25 按论文建索引（标题+摘要+关键词拼成一个文档），一篇论文一个分数。Dense 返回的是句子级 chunk。两者粒度不同，无法直接 RRF 融合。BM25 分数被转成"论文加权因子"（最大 0.3），提升该论文所有 chunk 的 dense_score——包括无关 chunk（参考文献、致谢也同幅提升）。
+
+**新版方案**：BM25 也做 chunk 级。每篇论文拆成多个 chunk：
+
+| chunk 类型 | heading_path | 内容来源 |
+|-----------|-------------|---------|
+| 标题 | "Title" | 论文标题 |
+| 摘要分句 | "Abstract" | 摘要按句末标点切分 |
+| 材料关键词 | "Keywords / Material" | 厚标注 keywords_material |
+| 方法关键词 | "Keywords / Method" | 厚标注 keywords_method |
+| 现象关键词 | "Keywords / Phenomenon" | 厚标注 keywords_phenomenon |
+| 关键发现 | "Key Findings" | 厚标注 key_findings |
+
+每篇论文产生 5~15 个 chunk，每个带 `paper_id` + `heading_path`。
+
+索引数据来源：`storage.get_all_papers()`（SQLite 中的标题+摘要+标注），不需要 Qdrant。利用已有的 `_bm25_fingerprint` 机制检测内容变更。
+
+**检索**：`bm25_search()` 返回 chunk 级结果，去重 key 为 `(paper_id, heading_path)`，同论文同章节只保留最高分。结果直接作为 RRF 融合的一路输入。
+
+**相比旧版的优势**：
+- 三路 RRF 同粒度直接融合，不需要中间的"加权因子"转换
+- "参考文献"等无关章节不会被误提（因为它们是独立的 chunk，不含查询关键词）
+- 关键词 chunk（材料/方法/现象）命中查询词时以独立 chunk 身份参与排序
+
+### 4.3 Dense — 语义向量检索
+
+文件：[retrieval.py:177-191](research_assistant/rag/retrieval.py#L177-L191)
+
+BGE-small-zh-v1.5 嵌入模型（512维，96MB）。`VectorStore.search()` → `embedder.encode_query()` → `QdrantClient.query_points()`。
+
+返回句子级 chunk（单个句子一个向量），携带 `paper_id`、`heading_path`、`window_text`、`dense_score`。
+
+### 4.4 RRF 融合 + heading_path 加权
+
+[retrieval.py:219-260](research_assistant/rag/retrieval.py#L219-L260) — RRF 公式 `1/(k+rank)`：
+
+```python
+rrf = 1.0 / (60 + rank)
+# rank=1 → 1/61 ≈ 0.0164, rank=10 → 1/70 ≈ 0.0143
+```
+
+不同检索源的绝对分数不可比（BM25=5.3 vs Qdrant=0.87 不是一个量纲），但排名可比。RRF 消除了量纲差异。
+
+三路融合的 key 函数：`f"{paper_id}|{heading_path[:60]}"`——同一篇论文同一章节的多路结果合并，不同章节各自独立。
+
+heading_path 加权（[retrieval.py:368-398](research_assistant/rag/retrieval.py#L368-L398)）：chunk 的章节路径命中查询词时，`rrf_score × (1 + 0.15 × 命中率)`。用户搜"研磨抛光"，chunk 来自"4.1 研磨工艺参数的影响"章节 → 排名提升。
+
+### 4.5 句子窗口分块
+
+文件：[chunking.py](research_assistant/rag/chunking.py)
+
+**核心思想**（借鉴 LlamaIndex Sentence Window Retrieval）：
+
+```
+索引: 单个句子 → BGE嵌入 → Qdrant检索 → 高精度匹配
+上下文: payload.window_text = 前后各 N 句 → LLM 看到完整上下文
+```
+
+[chunking.py:429-519](research_assistant/rag/chunking.py#L429-L519) — `chunk_paper_sentence_window()`：
+
+```python
+# 分句 → 窗口节点
+for i, sent in enumerate(all_sentences):
+    start = max(0, i - window_size)        # 前3句
+    end = min(total, i + window_size + 1)   # 后3句
+    marker = " ▶ " if j == i else "   "    # 命中句标箭头
+    window_text = "\n".join(window_parts)
+```
+
+检索时 [chunking.py:522-550](research_assistant/rag/chunking.py#L522-L550) — `post_process_sentence_window()` 将 `text` 从单句替换为窗口文本，保留 `_original_text`。
+
+**中英文自适应**（[ingestion.py:180-184](research_assistant/rag/ingestion.py#L180-L184)）：中文句子短（~24 tokens）→ window_size=5；英文句子长（~70 tokens）→ window_size=2。
+
+### 4.6 MQE 多查询扩展
+
+文件：[retrieval.py:502-529](research_assistant/rag/retrieval.py#L502-L529)
+
+LLM 生成 3 个语义等价的多样化查询："CVD温度优化" → "MPCVD沉积温度参数优化"、"金刚石薄膜生长温度影响"、"CVD process temperature optimization"。
+
+**为什么需要**：用户用自然语言问，论文用学术术语写。MQE 把用户查询翻译成论文里可能出现的多种表述，提升召回率。
+
+### 4.7 HyDE 假设文档嵌入
+
+文件：[retrieval.py:531-626](research_assistant/rag/retrieval.py#L531-L626)
+
+LLM 生成一段假设性答案段落 → 用假设答案搜知识库。上下文来源（优先级从高到低）：论文厚标注关键词 → 用户画像事实 → 研究进展记录。无上下文时 LLM 通用知识生成的段落仍比原始问题更像论文文本。
+
+### 4.8 search_papers_expanded — 完整扩展检索
+
+[retrieval.py:628-706](research_assistant/rag/retrieval.py#L628-L706)：
+
+```python
+expansions = [query] + mqe_queries + ([hyde_text] if hyde_text else [])
+for q in expansions:
+    results = self.search_papers(q, limit=per_expansion)
+    # MRR 合并：不同查询的结果累加排名分数
+    rrf_agg[key] += 1.0 / (60 + rank)
+```
+
+一篇论文在 3 个不同查询中都排进前 5 → 累计 MRR 很高 → 大概率是真正相关的论文。
+
+### 4.9 入库管线
+
+文件：[ingestion.py](research_assistant/rag/ingestion.py)
+
+六步流程：LLM 厚标注 → 完整性验证 + 二次补全 → SQLite 写入 → chunk + BGE 嵌入 + Qdrant 写入（失败回滚 SQLite）→ Neo4j 语义记忆提取。
+
+**厚标注**（[ingestion.py:36-67](research_assistant/rag/ingestion.py#L36-L67)）：一次性投入 ~800-2600 tokens LLM 调用，产出材料/方法/现象关键词、方法详情（参数+设备+测量什么）、关键发现、核心结论、遗留缺口。后续所有检索依赖这些标签的完整度。
+
+**回滚保证**（[ingestion.py:239-249](research_assistant/rag/ingestion.py#L239-L249)）：先写 SQLite 拿 paper_id → 再写 Qdrant → Qdrant 失败则 `delete_paper(paper_id)` 回滚。避免"SQLite 有记录但 Qdrant 没向量"的半入库状态。
