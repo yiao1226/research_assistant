@@ -67,7 +67,7 @@ class _RateLimiter:
 
 
 _arxiv_limiter = _RateLimiter(min_interval=6.0, cooldown=60.0)
-_s2_limiter = _RateLimiter(min_interval=1.5, cooldown=30.0)
+_s2_limiter = _RateLimiter(min_interval=4.0, cooldown=120.0)  # 匿名访问限流严格，有 S2_API_KEY 后可改为 2.0/60s
 
 
 def _http_get(url, params, headers=None, timeout=30, max_retries=3,
@@ -324,7 +324,13 @@ def search_semantic_scholar(query: str, max_results: int = 10, fields: str = "")
     url = f"{SEMANTIC_SCHOLAR_API}/paper/search"
     params = {"query": query, "limit": max_results, "fields": fields}
 
-    result = _http_get(url, params, timeout=30, max_retries=3, is_s2=True)
+    # S2 API Key: 提升限流额度 (100 req/5min vs 匿名 ~1 req/s)
+    s2_headers = {}
+    s2_api_key = os.getenv("S2_API_KEY", "")
+    if s2_api_key:
+        s2_headers["x-api-key"] = s2_api_key
+
+    result = _http_get(url, params, headers=s2_headers, timeout=30, max_retries=3, is_s2=True)
     if not result["ok"]:
         return json.dumps({"status": "error", "message": f"Semantic Scholar 无法访问: {result['error']}."}, ensure_ascii=False)
 
