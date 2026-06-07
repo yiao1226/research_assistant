@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 
 # ── 慢操作识别 ──
 
+# 注意: search_papers_online 不列为慢操作——它是交互式的，用户主动等结果，
+# 走后台会破坏搜索→展示→交互选择的流程。只有纯计算/嵌入类操作走后台。
 SLOW_TOOLS: dict[str, float] = {
-    "search_papers_online": 15.0,    # 多源搜索，正常 ~8s，上限 ~15s
     "ingest_papers": 60.0,           # PDF 入库 + BGE 嵌入，大文档 ~60s
 }
 
@@ -34,7 +35,6 @@ SLOW_TOOLS: dict[str, float] = {
 DEFAULT_SHUTDOWN_TIMEOUT = 10.0
 
 # 线程池大小：同类型工具最多同时跑的并发数
-MAX_CONCURRENT_SEARCH = 2    # ArXiv API rate limit 友好
 MAX_CONCURRENT_INGEST = 1    # BGE 嵌入 CPU 密集，单线程更好
 
 
@@ -45,8 +45,6 @@ def _is_slow_tool(tool_name: str) -> bool:
 
 def _max_concurrent(tool_name: str) -> int:
     """返回该工具类型的最大并发数。"""
-    if tool_name == "search_papers_online":
-        return MAX_CONCURRENT_SEARCH
     if tool_name == "ingest_papers":
         return MAX_CONCURRENT_INGEST
     return 1
@@ -167,12 +165,20 @@ class BackgroundTaskManager:
                     task.status = "completed"
                     task.finished_at = datetime.now().isoformat()
                 self._persist(task)
+                # 主动通知：后台任务完成后立即打印，不等下一轮 LLM
+                import sys
+                summary = result[:200].replace("\n", " ") + ("..." if len(result) > 200 else "")
+                print(f"\n✅ 后台任务完成: {command[:60]}", flush=True)
+                print(f"   {summary}", flush=True)
+                print(f"   💡 输入追问或继续对话即可看到结果", flush=True)
             except Exception as e:
                 with self._lock:
                     task.error = str(e)
                     task.status = "failed"
                     task.finished_at = datetime.now().isoformat()
                 self._persist(task)
+                import sys
+                print(f"\n❌ 后台任务失败: {command[:60]} — {e}", flush=True)
 
         executor = self._get_executor(tool_name)
         future = executor.submit(worker)
