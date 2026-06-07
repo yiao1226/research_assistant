@@ -73,7 +73,7 @@ _build_research_graph = None
 def _get_graph():
     global _build_research_graph
     if _build_research_graph is None:
-        from research_assistant.graph import build_research_graph as brg
+        from research_assistant.agent import build_research_graph as brg
         _build_research_graph = brg
     return _build_research_graph
 
@@ -130,7 +130,7 @@ def get_backup():
 
 
 def get_qa():
-    from research_assistant.tools.qa import QAService
+    from research_assistant.agent import QAService
     global _qa_instance
     if not user_manager.is_logged_in:
         return None
