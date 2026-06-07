@@ -465,3 +465,194 @@ for q in expansions:
 **厚标注**（[ingestion.py:36-67](research_assistant/rag/ingestion.py#L36-L67)）：一次性投入 ~800-2600 tokens LLM 调用，产出材料/方法/现象关键词、方法详情（参数+设备+测量什么）、关键发现、核心结论、遗留缺口。后续所有检索依赖这些标签的完整度。
 
 **回滚保证**（[ingestion.py:239-249](research_assistant/rag/ingestion.py#L239-L249)）：先写 SQLite 拿 paper_id → 再写 Qdrant → Qdrant 失败则 `delete_paper(paper_id)` 回滚。避免"SQLite 有记录但 Qdrant 没向量"的半入库状态。
+
+### 4.10 RRF 两层融合 + top-k 取值
+
+整个管线只用一种融合策略：RRF，用了两次。
+
+第一层（`search_papers` 内部）：三路 chunk 级 RRF — BM25(chunk) + Dense(句子) + SQLite(FTS5)。key = `(paper_id, heading_path)`。
+
+第二层（`search_papers_expanded`）：跨查询 RRF 累加。5 个扩展查询各自跑 search_papers → 同名 key 累加 rrf 分数。变量名叫 `_mrr_score`（[retrieval.py:701](research_assistant/rag/retrieval.py#L701)），实际是 aggregated RRF，不是 MRR。一篇论文在多个查询中都排前列 → 累计 RRF 高 → 真相关。
+
+top-k 逐层缩小：`search_papers` 每扩展查 4 条 → 5 扩展 × 4 = 20 候选 → RRF 跨查询累加 → dedup → top-20 → `query_knowledge_base` 取前 5 篇 → 每篇最多 3 个匹配 chunk → 格式化给 LLM。
+
+---
+
+## 五、工具系统
+
+### 5.1 工具工厂模式
+
+文件：[tools/__init__.py](research_assistant/tools/__init__.py)
+
+`make_all_agent_tools(storage, username)` 组装 5 个 `@tool`。每个 `make_*` 函数用闭包捕获 `storage` + `username`——同一个工具定义自动适配不同用户，不需要工厂类或依赖注入框架。
+
+[tools/kb.py:13-14](research_assistant/tools/kb.py#L13-L14)：
+
+```python
+def make_kb_tools(storage, username: str) -> list:
+    @tool
+    def query_knowledge_base(query: str, limit: int = 5) -> str:
+        retriever = HybridRetriever(storage, username)  # storage 是闭包变量
+```
+
+重型模块用 `__getattr__` 延迟导入（[tools/__init__.py:50-65](research_assistant/tools/__init__.py#L50-L65)）：`SearchOrchestrator`、`UploadManager` 等触发 `langchain_openai` ~7s 的模块只在真正使用时才 import。
+
+### 5.2 search_papers_online — 交互式外部搜索
+
+文件：[tools/search.py](research_assistant/tools/search.py)
+
+和 `query_knowledge_base`（搜本地）不同，它搜外网 ArXiv + Semantic Scholar。关键设计：
+
+1. **交互式**：搜完展示 Top-5 → 用户 `[I]` 入库 / `[D]` 下载 / `[S]` 跳过。只入库用户感兴趣的论文，不浪费 Qdrant 存储。
+2. **跨工具状态**：`_last_search_papers` 模块级变量。`search_papers_online` 搜完存结果 → `ingest_papers` 读取。Agent 多步操作间的隐式状态传递。
+3. **约束 LLM**：docstring 里"不要直接写综述"被注入 System Prompt，防止 LLM 拿到搜索结果后编造综述。
+
+### 5.3 SearchOrchestrator — 四步编排
+
+文件：[tools/search_orchestrator.py](research_assistant/tools/search_orchestrator.py)
+
+```
+build_search_context()  → 从进展+论文关键词+知识缺口构建用户画像
+expand_query()          → LLM 基于画像扩展多角度搜索词（优先覆盖知识缺口）
+search_all_sources()    → 多源并行搜索（ArXiv+S2+WoS, ThreadPoolExecutor）
+rank_papers()           → LLM 重排序 + 提取核心贡献/创新点/相关性理由
+```
+
+LLM 排序的附加价值：不仅排序，还顺便提取每条论文的核心贡献——这笔 LLM 调用同时服务排序和后续展示。
+
+### 5.4 速率限制 + HTTP 重试
+
+文件：[tools/paper_search.py](research_assistant/tools/paper_search.py)
+
+线程安全的 `_RateLimiter`：最小间隔控制 + 429 冷却期。ArXiv 间隔 6s（实测安全线），S2 间隔 1.5s。
+
+`_http_get` 统一入口：429 → 指数退避 30s/60s/120s + 冷却 60s；403/5xx/Timeout → 退避 5s/10s/20s。最多重试 3 次。
+
+### 5.5 LangChain @tool vs 原生 function calling
+
+| | LangChain @tool | 原生 function calling |
+|---|---|---|
+| Schema | 函数签名 → Pydantic 自动生成 | 手写 JSON Schema |
+| 描述 | docstring 第一行 | 手写 `description` |
+| 执行 | `t.invoke(args)` 自动路由 | 手动 `if name == "xxx": dispatch` |
+| 共用 | Agent + LangGraph 同一套工具 | 两处各写 dispatch |
+
+项目选 LangChain 是因为 Agent（qa.py）和 LangGraph（graph.py）共用同一套工具定义。代价是 `langchain_openai` 导入 ~7s——通过延迟导入缓解。
+
+---
+
+## 六、工程实践
+
+### 6.1 三级延迟加载
+
+| 级别 | 位置 | 延迟内容 | 省时 |
+|------|------|---------|------|
+| CLI 命令层 | [commands.py:11-15](cli/commands.py#L11-L15) | `_get_em`/`_get_graph` 首次调用才 import | ~12s |
+| 工具模块层 | [tools/__init__.py:50-65](research_assistant/tools/__init__.py#L50-L65) | `__getattr__` 按需导入 SearchOrchestrator 等 | ~7s |
+| Agent 层 | [main.py:47-48](main.py#L47-L48) | BGE 模型 96MB，登录后再加载 | ~3s |
+
+CLI 启动 1s 出现提示符，具体功能用到时才加载。
+
+### 6.2 原子写入
+
+两处：
+
+1. **user_facts.json**（[user_profile.py:82-93](research_assistant/memory/user_profile.py#L82-L93)）：临时文件 + `os.replace`。POSIX 原子操作——要么全成功，要么原文件不变。
+2. **SQLite WAL 模式**（[storage.py:41-42](research_assistant/core/storage.py#L41-L42)）：写操作先 append 到 WAL 文件，后台异步合并。断电不丢数据。
+
+### 6.3 错误处理分层
+
+- **可恢复**：Neo4j 离线 → 跳过语义记忆提取不中断入库；Qdrant 离线 → pre_tool Hook 返回降级文本
+- **半恢复**：入库 Qdrant 失败 → 回滚 SQLite 记录
+- **不可恢复**：SQLite 不可写 → 异常上抛 → CLI 提示用户
+
+### 6.4 SQLite 设计
+
+5 表：papers / progress / plans / search_history / session_log / background_tasks（我们加的）。
+
+FTS5 全文索引（[storage.py:84-107](research_assistant/core/storage.py#L84-L107)）：触发式自动同步，`content='papers'` 不复制数据只存索引。替代 `LIKE '%kw%'` 全表扫描。
+
+JSON 字段自动反序列化（[storage.py:408-421](research_assistant/core/storage.py#L408-L421)）：`_row_to_dict` 对调用方透明。
+
+### 6.5 多用户隔离
+
+文件：[core/user_manager.py](research_assistant/core/user_manager.py)
+
+物理隔离：`data/users/{name}/` 各自独立。Qdrant collection 前缀 `user_{name}_`。用户名净化（`re.sub(r'[^a-z0-9_]', '_', name)`）防路径注入。用户删除时清 SQLite + Qdrant + 文件。
+
+### 6.6 备份系统（4层）
+
+| 层 | 机制 | 恢复 |
+|---|------|------|
+| 1 | SQLite WAL | 断电不丢 |
+| 2 | Qdrant 持久化 | `rebuild_vectors_from_sqlite()` 从 SQLite 重建 |
+| 3 | JSON 快照 | 每日自动，保留 7 天 |
+| 4 | 操作日志 | 按月归档，含丰富摘要供 LLM 生成会话总结 |
+
+操作日志的"丰富摘要"是关键——不是只记标题。入库日志含核心结论，综述日志含 300 字结论，进展日志含描述+结果+洞察。这些摘要被 `EpisodicMemory.generate_session_summary()` 读取 → LLM 结构化总结。
+
+### 6.7 测试策略
+
+43 个测试，零外部依赖。信号检测、事实合并、去重是纯函数。`tempfile` 隔离文件系统。Mock 工具替代真实 API。
+
+### 6.8 LLM JSON 解析
+
+文件：[utils/json_utils.py](research_assistant/utils/json_utils.py)
+
+统一处理 LLM 返回的三种格式：纯 JSON、Markdown 代码块（\`\`\`json）、无标注代码块（\`\`\`）。`try_extract_json` 容错版——解析失败返回默认值。全项目通过 `from ..utils import extract_json_from_llm_response` 统一使用。
+
+---
+
+## 七、面试问答要点
+
+### 7.1 项目概述
+
+> 科研助手——AI Agent + LangGraph 工作流 + 四层记忆 + RAG。45 文件 ~8500 行。Agent 自主调用 5 工具（知识库/进展/历史/搜索/入库），LangGraph 4 节点 / 3 路径 / interrupt 人机协同，记忆四层（工作→用户画像→情景→语义），检索 BM25(chunk级)+Dense(512维)+RRF+MQE+HyDE。
+
+### 7.2 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| Agent 循环 | 自研 agent_loop | 需两阶段策略（invoke/stream）+ Hook 挂载 |
+| 工作流 | LangGraph | SqliteSaver 持久化 + interrupt 人机协同 |
+| 工具定义 | LangChain @tool | Agent + LangGraph 共用同一套定义 |
+| BM25 粒度 | chunk 级（重构后） | 和 Dense 同粒度直接 RRF，消除加权因子 |
+| 防抖事实提取 | 30s 一次性定时器 | 省钱 + 提升质量（完整上下文） |
+| 上下文压缩 | 三段式（L1/L2/L3） | 便宜的在前，贵的在后 |
+| 真值源 | SQLite | Qdrant 可从 SQLite 重建 |
+
+### 7.3 高频追问
+
+**Q: Hook 的 pre_tool 拦截有什么实际用途？**
+> Qdrant 离线降级、慢操作后台路由、结果缓存。不改 agent_loop，一行注册新行为。开闭原则在 Agent 架构里的实践。
+
+**Q: interrupt() 之后用户关电脑了，下次还能继续吗？**
+> 能。SqliteSaver 已写入 SQLite。相同 thread_id 恢复 → 从断点继续。
+
+**Q: BM25 为什么改成 chunk 级？**
+> 旧版论文级和 Dense 句子级粒度不同，只能转加权因子。同论文所有 chunk 同幅提升——参考文献被误提。新版 chunk 级直接三路 RRF 融合。
+
+**Q: 30s 防抖如果用户不停说话怎么办？**
+> 退出时 `add_nowait_flush()` 兜底。改进方向：最大间隔强制提取。
+
+**Q: 语义记忆 Neo4j 离线怎么降级？**
+> `available` 属性每次检查。离线时返回 `{"entity_count": 0}`，入库不中断。
+
+**Q: 最大的 tradeoff？**
+> 厚标注的一次性 LLM 投入 vs 传统零成本入库。科研场景论文量 <1000，检索质量 > 入库速度。值。
+
+**Q: 最自豪的设计？**
+> Hook 系统。从日志、Qdrant 降级到后台任务路由，全部通过 `register_hook` 挂上去，`agent_loop` 一个字符没动。
+
+### 7.4 改进方向
+
+- 防抖自适应（快节奏用户 15s，深度思考 60s）
+- 信号检测用 LLM 替代纯正则
+- 事实提取结果展示给用户确认
+- 后台任务进度通知
+- 优雅关闭的分级策略（已实现）
+- Web 化（RuntimeContext session 管理、SSE 推送、连接池）
+
+**厚标注**（[ingestion.py:36-67](research_assistant/rag/ingestion.py#L36-L67)）：一次性投入 ~800-2600 tokens LLM 调用，产出材料/方法/现象关键词、方法详情（参数+设备+测量什么）、关键发现、核心结论、遗留缺口。后续所有检索依赖这些标签的完整度。
+
+**回滚保证**（[ingestion.py:239-249](research_assistant/rag/ingestion.py#L239-L249)）：先写 SQLite 拿 paper_id → 再写 Qdrant → Qdrant 失败则 `delete_paper(paper_id)` 回滚。避免"SQLite 有记录但 Qdrant 没向量"的半入库状态。
