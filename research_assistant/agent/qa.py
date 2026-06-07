@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -83,6 +85,157 @@ register_hook("agent_start", _progress_hook)
 register_hook("pre_tool", _tool_log_hook)
 register_hook("post_tool", _tool_result_hook)
 register_hook("agent_end", _agent_done_hook)
+
+
+# ═══════════════════════════════════════════════════════════
+# 内置 Hook: Qdrant 离线降级兜底
+# ═══════════════════════════════════════════════════════════
+
+# 依赖 Qdrant 的工具映射
+_QDRANT_TOOLS = {
+    "query_knowledge_base": "知识库检索",
+    "query_progress": "进展查询",
+    "recall_history": "历史回忆",
+    "ingest_papers": "论文入库",
+}
+
+# 健康检查缓存：避免每次工具调用都探测
+_qdrant_health = {"alive": True, "checked_at": 0.0}
+_QDRANT_CHECK_TTL = 30.0  # 30 秒内复用缓存结果
+
+
+def _probe_qdrant() -> bool:
+    """探测 Qdrant 是否在线。
+
+    30 秒内缓存结果，避免每次工具调用增加 ~100ms 网络开销。
+    检测用轻量操作（get_collections），超时 2 秒。
+    """
+    now = time.time()
+    if now - _qdrant_health["checked_at"] < _QDRANT_CHECK_TTL:
+        return _qdrant_health["alive"]
+
+    try:
+        from qdrant_client import QdrantClient
+        client = QdrantClient(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            timeout=2.0,
+        )
+        client.get_collections()
+    except Exception:
+        _qdrant_health["alive"] = False
+    else:
+        _qdrant_health["alive"] = True
+
+    _qdrant_health["checked_at"] = time.time()
+    return _qdrant_health["alive"]
+
+
+def _qdrant_fallback_hook(name: str, _args: dict):
+    """pre_tool: Qdrant 离线时拦截依赖工具，返回降级提示。
+
+    只拦截依赖 Qdrant 的工具（搜索/入库）。
+    search_papers_online 走外网 API，不受影响，不拦截。
+    返回非 None → 工具真实逻辑被跳过，LLM 收到降级文本。
+    """
+    if name not in _QDRANT_TOOLS:
+        return None  # 不受影响的工具（如 search_papers_online）
+
+    if _probe_qdrant():
+        return None  # Qdrant 在线，放行
+
+    label = _QDRANT_TOOLS[name]
+
+    if name == "ingest_papers":
+        return (
+            f"（{label}暂时不可用——向量数据库离线。"
+            "论文元数据已保存到 SQLite，向量索引将在恢复后重建。"
+            "请告知用户：启动 Docker Qdrant 容器后重试入库。）"
+        )
+    else:
+        return (
+            f"（{label}暂时不可用——向量数据库离线。"
+            "请基于你的训练知识和对话历史回答用户问题，"
+            "并建议用户执行 docker start qdrant 启动向量数据库。）"
+        )
+
+
+register_hook("pre_tool", _qdrant_fallback_hook)
+
+
+# ═══════════════════════════════════════════════════════════
+# 内置 Hook: 后台任务通知注入 + 慢操作路由
+# ═══════════════════════════════════════════════════════════
+
+# 模块级工具引用：_bg_dispatch_hook 需要访问工具列表来做后台派发
+_current_tools: list = []
+
+
+def _bg_notification_hook(messages: list):
+    """before_llm: 将已完成的后台任务结果注入消息列表。
+
+    在每轮 LLM 调用前检查是否有后台任务完成，
+    有则拼入 HumanMessage 让 LLM 看到。
+    """
+    from .background import get_bg_manager
+    try:
+        mgr = get_bg_manager()
+    except RuntimeError:
+        return  # 未初始化，跳过
+    notifications = mgr.collect_notifications()
+    if notifications:
+        from langchain_core.messages import HumanMessage
+        content = "[后台任务完成通知]\n\n" + "\n\n".join(notifications)
+        messages.append(HumanMessage(content=content))
+        import sys
+        print(f"\n📨 后台任务结果已注入 ({len(notifications)} 条)", flush=True)
+
+
+def _bg_dispatch_hook(name: str, args: dict):
+    """pre_tool: 慢操作路由到后台线程。
+
+    返回 "__BG_DISPATCHED__" sentinel 标记，
+    由 agent_loop 识别并跳过 _exec_tool 调用。
+    """
+    from .background import _is_slow_tool, get_bg_manager
+    if not _is_slow_tool(name):
+        return None  # 快速工具，不拦截
+
+    try:
+        mgr = get_bg_manager()
+    except RuntimeError:
+        return None  # 未初始化，降级为同步执行
+
+    if mgr.is_shutting_down:
+        return None  # 关闭中，降级为同步执行
+
+    # 找到对应的工具实例
+    tool = None
+    for t in _current_tools:
+        if t.name == name:
+            tool = t
+            break
+    if tool is None:
+        return None
+
+    # 构造命令描述
+    arg_preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in args.items())
+    command = f"{name}({arg_preview})"
+
+    import sys
+    print(f"  ⏳ 后台派发 {command[:60]}...", flush=True)
+
+    # 派发后台任务
+    task_id = mgr.dispatch(
+        tool_name=name,
+        command=command,
+        fn=lambda: str(tool.invoke(args) if tool else "（工具不可用）"),
+    )
+
+    return f"[后台任务 {task_id} 已启动]\n{command}\n结果将在完成后自动通知你。"
+
+
+register_hook("before_llm", _bg_notification_hook)
+register_hook("pre_tool", _bg_dispatch_hook)
 
 
 # ============================================================
@@ -261,8 +414,15 @@ class QAService:
         """主入口: 组装 → agent_loop → 回答。"""
         trigger_hooks("agent_start", question)
 
+        # 初始化后台任务管理器
+        from .background import get_bg_manager
+        get_bg_manager(self.storage, self.username)
+
         # 工具 + 动态 System Prompt
         tools = make_all_agent_tools(self.storage, self.username)
+        _current_tools.clear()
+        _current_tools.extend(tools)
+
         context = self._build_context()
         system = build_system_prompt(tools, context)
 
@@ -282,8 +442,9 @@ class QAService:
         # ── Agent 循环 ──
         messages, tool_log = agent_loop(messages, tools, llm_with_tools)
 
-        # 清理压缩 Hook
+        # 清理
         HOOKS["before_llm"].remove(compaction)
+        _current_tools.clear()
 
         # 提取回答和引用
         final = messages[-1]

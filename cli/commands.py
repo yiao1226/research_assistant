@@ -841,4 +841,25 @@ def _on_quit():
     backup = get_backup()
     if backup:
         backup.full_backup()
+
+    # ── 后台任务优雅关闭 ──
+    try:
+        from research_assistant.agent.background import get_bg_manager
+        mgr = get_bg_manager()
+        running = mgr.running_count
+        if running > 0:
+            mgr.shutdown(timeout=10.0)
+    except Exception:
+        pass  # 未初始化或已关闭
+
+    # ── 提示中断恢复 ──
+    try:
+        from research_assistant.agent.background import get_bg_manager
+        mgr = get_bg_manager()
+        interrupted = mgr.resume_interrupted()
+        if interrupted:
+            print(f"\n⚠ 上次有 {len(interrupted)} 个未完成的后台任务，下次登录时可恢复。")
+    except Exception:
+        pass
+
     print("\n再见！")

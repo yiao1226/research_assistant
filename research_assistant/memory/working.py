@@ -90,6 +90,9 @@ class WorkingMemory:
         self._any_correction_detected = False
         self._any_reinforcement_detected = False
 
+        # 事实提取进度追踪：避免重复发送已提取的轮次给 LLM
+        self._last_extracted_index = 0  # 上次提取到了 turns 的第几个位置
+
         # 防抖定时器
         self._debounce_timer: threading.Timer | None = None
         self._timer_lock = threading.Lock()
@@ -204,10 +207,17 @@ class WorkingMemory:
     def _extract_and_persist_facts(self):
         """LLM 提取结构化事实并持久化。
 
+        只发送上次提取之后的新轮次，避免重复传输已处理过的对话文本。
         在后台线程中同步执行（不阻塞主流程）。
         """
         if len(self.turns) < 2:
             logger.debug("轮次不足，跳过事实提取")
+            return
+
+        # ── 只取未提取过的新轮次 ──
+        new_turns = self.turns[self._last_extracted_index:]
+        if len(new_turns) < 2:
+            logger.debug("新轮次不足（%d），跳过事实提取", len(new_turns))
             return
 
         try:
@@ -219,9 +229,9 @@ class WorkingMemory:
             except Exception:
                 existing_facts = []
 
-            # LLM 提取
+            # LLM 提取（只传新轮次）
             result = extract_facts_from_conversation(
-                self.turns,
+                new_turns,
                 existing_facts=existing_facts,
                 correction_detected=self._any_correction_detected,
                 reinforcement_detected=self._any_reinforcement_detected,
@@ -262,9 +272,10 @@ class WorkingMemory:
             else:
                 logger.debug("事实提取无新结果")
 
-            # 重置信号
+            # 重置信号 + 更新提取进度
             self._any_correction_detected = False
             self._any_reinforcement_detected = False
+            self._last_extracted_index = len(self.turns)   # ← 标记：这些轮次已提取
 
         except Exception:
             logger.exception("事实提取失败")
@@ -394,6 +405,7 @@ class WorkingMemory:
         self._consolidated.clear()
         self._any_correction_detected = False
         self._any_reinforcement_detected = False
+        self._last_extracted_index = 0
 
     def stats(self) -> dict:
         return {

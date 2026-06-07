@@ -156,6 +156,21 @@ class PerUserStorage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_session_type ON session_log(op_type);
                 CREATE INDEX IF NOT EXISTS idx_session_ts ON session_log(timestamp);
+
+                CREATE TABLE IF NOT EXISTS background_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT UNIQUE NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',  -- running | completed | failed | interrupted
+                    result TEXT,
+                    error TEXT,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    username TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bg_status ON background_tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_bg_username ON background_tasks(username);
             """)
 
     # === Paper CRUD ===
@@ -372,6 +387,42 @@ class PerUserStorage:
                 (op_type, summary, json.dumps(details, ensure_ascii=False) if details else None,
                  duration_sec, 1 if success else 0),
             )
+
+    # === Background Tasks ===
+
+    def save_background_task(self, task_id: str, tool_name: str, command: str,
+                             username: str) -> int:
+        """新增后台任务记录，返回 row id。"""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO background_tasks
+                   (task_id, tool_name, command, status, started_at, username)
+                   VALUES (?, ?, ?, 'running', datetime('now'), ?)""",
+                (task_id, tool_name, command, username),
+            )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def update_background_task(self, task_id: str, status: str,
+                                result: str = "", error: str = ""):
+        """更新后台任务状态。"""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE background_tasks
+                   SET status=?, result=?, error=?, finished_at=datetime('now')
+                   WHERE task_id=?""",
+                (status, result, error, task_id),
+            )
+
+    def get_interrupted_tasks(self, username: str) -> list[dict]:
+        """获取上次被中断的任务（供恢复用）。"""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM background_tasks
+                   WHERE username=? AND status='interrupted'
+                   ORDER BY started_at""",
+                (username,),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
 
     # === Backup ===
 

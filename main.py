@@ -269,6 +269,19 @@ def interactive_mode():
                 for q in unresolved[:3]:
                     print(f"  - {q}")
 
+    # 中断任务恢复提示
+    try:
+        from research_assistant.agent.background import get_bg_manager
+        mgr = get_bg_manager(user.init_storage() or user.storage, name)
+        interrupted = mgr.resume_interrupted()
+        if interrupted:
+            print(f"\n⚠ 上次 {len(interrupted)} 个后台任务未完成:")
+            for t in interrupted[:5]:
+                print(f"  - [{t['task_id']}] {t['tool_name']}: {t.get('command', '?')[:80]}")
+            print("  相关论文可能需要重新入库或重新搜索。")
+    except Exception:
+        pass
+
     print(COMMAND_LIST)
 
     # 斜杠命令分发（快速通道）
