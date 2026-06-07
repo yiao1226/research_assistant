@@ -1,10 +1,11 @@
 """混合检索 — BM25 关键词 + Dense 语义向量 + RRF 融合 + LLM 重排序。
 
 检索路径:
-  1. BM25 → SQLite 全文匹配（精确关键词命中）
-  2. Dense → Qdrant 语义向量检索（跨语言、同义词语义匹配）
-  3. RRF → 两路结果融合排序
-  4. LLM Re-rank → 对 Top-N 用 LLM 评估相关性
+  1. BM25 → chunk 级关键词匹配（jieba 分词，论文元数据分句索引）
+  2. Dense → Qdrant 语义向量检索（BGE 512维，句子窗口）
+  3. SQLite → FTS5 全文索引直搜
+  4. RRF → 三路融合排序（BM25 + Dense + SQLite 同粒度）
+  5. LLM Re-rank → 对 Top-N 用 LLM 评估相关性
 """
 from __future__ import annotations
 
@@ -73,58 +74,136 @@ class HybridRetriever:
     # === BM25 ===
 
     def ensure_bm25_index(self):
-        """构建/刷新 BM25 索引（论文内容变化时才重建）。"""
+        """构建/刷新 chunk 级 BM25 索引。
+
+        不再按论文建索引——将每篇论文的标题、摘要分句、标注关键词拆成
+        多个 chunk 作为 BM25 的独立文档。这样 BM25 和 Dense 都在同一
+        (chunk) 粒度，可以直接 RRF 融合，不会出现"一篇论文所有 chunk
+        同幅提升"的问题。
+        """
         papers = self.storage.get_all_papers()
-        # 用论文 ID + 标注关键词生成指纹，检测内容变更
         fp = _bm25_fingerprint(papers)
         if fp == self._bm25_fingerprint and self._bm25 is not None:
             return
         self._bm25_fingerprint = fp
-        self._bm25_docs = papers
+
+        self._bm25_docs = []  # 每个元素是一个 chunk dict
         corpus = []
+
         for p in papers:
-            # 索引文本: 标题 + 摘要 + 标注关键词
-            text_parts = [p.get("title", "")]
-            text_parts.append(p.get("abstract", "")[:500])
+            pid = p.get("id", "")
+            title = p.get("title", "")
+            abstract = (p.get("abstract", "") or "")[:500]
+
+            # ── 解析标注 ──
             annotation = p.get("annotation")
-            if annotation:
-                if isinstance(annotation, str):
-                    try:
-                        annotation = json.loads(annotation)
-                    except json.JSONDecodeError:
-                        annotation = {}
-                if isinstance(annotation, dict):
-                    for key in ["keywords_material", "keywords_method",
-                                "keywords_phenomenon", "key_findings"]:
-                        vals = annotation.get(key, [])
-                        if isinstance(vals, list):
-                            text_parts.append(" ".join(vals))
-            corpus.append(" ".join(text_parts))
+            if isinstance(annotation, str):
+                try:
+                    annotation = json.loads(annotation)
+                except json.JSONDecodeError:
+                    annotation = {}
+            if not isinstance(annotation, dict):
+                annotation = {}
+
+            mat_kw = " ".join(annotation.get("keywords_material", []))
+            meth_kw = " ".join(annotation.get("keywords_method", []))
+            phen_kw = " ".join(annotation.get("keywords_phenomenon", []))
+            findings = " ".join(annotation.get("key_findings", []))
+            core = annotation.get("core_claim", "")
+
+            # ── chunk 1: 标题 ──
+            if title:
+                corpus.append(title)
+                self._bm25_docs.append({
+                    "paper_id": pid, "title": title,
+                    "heading_path": "Title",
+                    "abstract": abstract, "core_claim": core,
+                })
+
+            # ── chunk 2..N: 摘要逐句切分 ──
+            if abstract:
+                import re
+                sents = re.split(r'(?<=[。！？.!?])\s*', abstract)
+                for sent in sents:
+                    sent = sent.strip()
+                    if len(sent) >= 8:
+                        corpus.append(sent)
+                        self._bm25_docs.append({
+                            "paper_id": pid, "title": title,
+                            "heading_path": "Abstract",
+                            "abstract": abstract, "core_claim": core,
+                        })
+
+            # ── chunk 材料关键词 ──
+            if mat_kw.strip():
+                corpus.append(mat_kw)
+                self._bm25_docs.append({
+                    "paper_id": pid, "title": title,
+                    "heading_path": "Keywords / Material",
+                    "abstract": abstract, "core_claim": core,
+                })
+
+            # ── chunk 方法关键词 ──
+            if meth_kw.strip():
+                corpus.append(meth_kw)
+                self._bm25_docs.append({
+                    "paper_id": pid, "title": title,
+                    "heading_path": "Keywords / Method",
+                    "abstract": abstract, "core_claim": core,
+                })
+
+            # ── chunk 现象/性能关键词 ──
+            if phen_kw.strip():
+                corpus.append(phen_kw)
+                self._bm25_docs.append({
+                    "paper_id": pid, "title": title,
+                    "heading_path": "Keywords / Phenomenon",
+                    "abstract": abstract, "core_claim": core,
+                })
+
+            # ── chunk 关键发现 ──
+            if findings.strip():
+                corpus.append(findings)
+                self._bm25_docs.append({
+                    "paper_id": pid, "title": title,
+                    "heading_path": "Key Findings",
+                    "abstract": abstract, "core_claim": core,
+                })
+
         tokenized = [_tokenize(doc) for doc in corpus]
-        if tokenized:
-            self._bm25 = BM25Okapi(tokenized)
-        else:
-            self._bm25 = None
+        self._bm25 = BM25Okapi(tokenized) if tokenized else None
 
     def bm25_search(self, query: str, limit: int = 10) -> list[dict]:
-        """BM25 关键词搜索。"""
+        """BM25 chunk 级关键词搜索。
+
+        Returns:
+            chunk 级结果，每条含 paper_id / heading_path / title / bm25_score，
+            可直接作为 RRF 融合的一路输入。
+        """
         if self._bm25 is None:
             self.ensure_bm25_index()
-        if self._bm25 is None:
+        if self._bm25 is None or not self._bm25_docs:
             return []
 
         tokens = _tokenize(query)
         scores = self._bm25.get_scores(tokens)
-        # 排序取 top
         indexed = list(enumerate(scores))
         indexed.sort(key=lambda x: x[1], reverse=True)
         results = []
-        for idx, score in indexed[:limit]:
-            if score > 0:
-                doc = dict(self._bm25_docs[idx])
-                doc["bm25_score"] = float(score)
-                results.append(doc)
-        return results
+        seen = set()
+        for idx, score in indexed[:limit * 3]:  # 多取一些，后面去重
+            if score <= 0:
+                continue
+            doc = dict(self._bm25_docs[idx])
+            # 去重：同一篇论文的同一 heading_path 只留最高分
+            key = f"{doc.get('paper_id', '')}|{(doc.get('heading_path', '') or '')[:60]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            doc["bm25_score"] = float(score)
+            doc["id"] = doc.get("paper_id")  # RRF key_fn 需要 id 字段
+            results.append(doc)
+        return results[:limit]
 
     # === Dense ===
 
@@ -205,58 +284,41 @@ class HybridRetriever:
     def search_papers(self, query: str, limit: int = 20) -> list[dict]:
         """对论文库执行混合检索。
 
-        四路融合:
-          1. BM25 — 论文级关键词匹配 → 转为 Dense chunk 加权因子
+        三路 RRF 融合（同粒度: chunk 级）:
+          1. BM25 — chunk 级关键词匹配（论文元数据分句索引）
           2. Dense — Qdrant 语义向量检索（句子窗口）
-          3. SQLite — 本地关键词直搜
-          4. heading_path 加权 — chunk 标题路径命中提升
+          3. SQLite — FTS5 全文索引直搜
+          4. heading_path 加权 — chunk 标题路径命中查询词提升
 
-        BM25 论文级 / Dense chunk 级粒度不同，不直接 RRF 融合。
-        BM25 分数转为"论文级加权"，提升该论文所有 chunk 的排名。
+        三路结果都在 chunk 粒度，RRF key 为 (paper_id, heading_path)，
+        同一篇论文不同章节的 chunk 各自独立参与排序。
         """
-        # BM25 → 论文级加权映射
-        bm25_results = self.bm25_search(query, limit=limit)
-        paper_bm25_boost = {}
-        if bm25_results:
-            bm25_scores = [r.get("bm25_score", 0) for r in bm25_results]
-            max_bm25 = max(bm25_scores) if bm25_scores else 1.0
-            for r in bm25_results:
-                pid = str(r.get("paper_id") or r.get("id", ""))
-                if pid and max_bm25 > 0:
-                    # 归一化到 [0, 1]，乘以 0.3 作为最大加权幅度
-                    paper_bm25_boost[pid] = (r.get("bm25_score", 0) / max_bm25) * 0.3
+        # BM25 chunk 级
+        bm25_results = self.bm25_search(query, limit=limit * 2)
 
-        # Dense 路径
+        # Dense 向量检索
         dense_results = self.dense_search("papers", query, limit=limit)
 
         # 句子窗口后处理: 用 window_text 替换检索到的句子
         from .chunking import post_process_sentence_window
         dense_results = post_process_sentence_window(dense_results)
 
-        # 应用 BM25 论文级加权到每个 Dense chunk
+        # BM25 元的论文级字段（title/abstract/core_claim）补全到 Dense chunk
         for r in dense_results:
             pid = str(r.get("paper_id") or "")
-            boost = paper_bm25_boost.get(pid, 0.0)
-            if boost > 0:
-                r["dense_score"] = r.get("dense_score", 0) * (1.0 + boost)
-                # 同时将 BM25 的元数据（title/abstract）补全到 chunk
-                self._inject_bm25_meta(r, bm25_results, pid)
+            self._inject_bm25_meta(r, bm25_results, pid)
 
-        # SQLite 关键词直搜（补充）
+        # SQLite 关键词直搜
         sql_results = self.storage.search_papers_local(query.split(), limit=limit)
 
-        # 两路 RRF 融合（Dense + SQLite），按 (paper_id, heading_path) 分chunk，
-        # 避免把同论文不同章节压成一个
+        # 三路 RRF 融合（BM25 + Dense + SQLite），按 (paper_id, heading_path) 去重
         fused = self.rrf_fuse(
-            [dense_results, sql_results],
+            [bm25_results, dense_results, sql_results],
             key_fn=lambda doc: (
                 f"{doc.get('paper_id') or doc.get('id')}|"
                 f"{(doc.get('heading_path') or '')[:60]}"
             ),
         )
-
-        # 按 dense_score 重排（BM25 boost 已在 dense_score 中）
-        fused.sort(key=lambda d: d.get("dense_score", 0), reverse=True)
 
         # heading_path 关键词加权
         boosted = self._boost_by_heading_path(fused, query)
