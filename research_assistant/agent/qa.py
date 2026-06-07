@@ -53,18 +53,23 @@ def trigger_hooks(event: str, *args):
 
 def _progress_hook(question: str):
     """agent_start: 显示当前轮次和问题。"""
-    print(f"\n🤖 分析: {question[:60]}...")
+    import sys
+    print(f"\n🤖 分析: {question[:60]}...", flush=True)
 
 def _tool_log_hook(name: str, args: dict):
     """pre_tool: 显示工具调用。"""
+    import sys
     arg_preview = {k: str(v)[:60] for k, v in args.items()}
-    print(f"  🔧 {name}({arg_preview})")
+    label = {"search_papers_online": "🔍 外部搜索", "query_knowledge_base": "📚 知识库检索",
+             "query_progress": "📋 进展查询", "recall_history": "🧠 历史回忆"}.get(name, "🔧")
+    print(f"  {label} {name}({arg_preview})", flush=True)
     return None
 
 def _tool_result_hook(_name: str, _args: dict, result: str):
     """post_tool: 显示工具结果摘要。"""
-    preview = str(result)[:100].replace("\n", " ")
-    print(f"     → {preview}")
+    import sys
+    preview = str(result)[:120].replace("\n", " ")
+    print(f"     → {preview}", flush=True)
 
 def _agent_done_hook(result: dict):
     """agent_end: 显示统计。"""
@@ -95,9 +100,16 @@ AGENT_SYSTEM_TEMPLATE = """你是科研助手，帮助用户进行学术研究�
 - 问候/闲聊/概念解释: 不调工具，直接友好回答
 - 科研问题(需要数据): 先调 query_knowledge_base，不够再调其他
 - 回忆历史: 调 recall_history
-- 找新论文: 调 search_papers_online
+- 找新论文/外部搜索: 调 search_papers_online → 结果展示后会交互询问入库
 - 可组合调用多个工具
 - 工具无结果时诚实告知，不编造
+
+## 重要: 搜索后不要直接写综述
+
+- search_papers_online 搜完后，工具本身会向用户展示结果并询问入库
+- 用户选择入库后，你可以简要总结论文方向
+- 只有当用户明确说"写综述"/"review"时，才进入综述模式
+- 普通搜索只是展示结果 + 用户选择，不需要自动综述
 
 ## 回答格式
 
@@ -257,6 +269,11 @@ class QAService:
         llm = get_llm(temperature=0.3, max_tokens=2048)
         llm_with_tools = llm.bind_tools(tools)
 
+        # 注册上下文压缩（捕获 llm 用于 L3）
+        from .compaction import compaction_hook
+        compaction = lambda msgs: compaction_hook(msgs, llm_with_tools)
+        HOOKS["before_llm"].append(compaction)
+
         messages = [
             SystemMessage(content=system),
             HumanMessage(content=question),
@@ -264,6 +281,9 @@ class QAService:
 
         # ── Agent 循环 ──
         messages, tool_log = agent_loop(messages, tools, llm_with_tools)
+
+        # 清理压缩 Hook
+        HOOKS["before_llm"].remove(compaction)
 
         # 提取回答和引用
         final = messages[-1]

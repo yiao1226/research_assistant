@@ -41,9 +41,9 @@ def make_all_agent_tools(storage, username: str) -> list:
         LangChain @tool 列表
     """
     kb_tools = make_kb_tools(storage, username)
-    search_tool = make_search_tool(storage, username)
+    search_tools = make_search_tool(storage, username)
     history_tool = make_history_tool(storage, username)
-    return [*kb_tools, search_tool, history_tool]
+    return [*kb_tools, *search_tools, history_tool]
 
 
 # 重量级模块：延迟导入（触发 langchain_openai ~7s）
