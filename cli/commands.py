@@ -726,6 +726,13 @@ def _run_graph_workflow(topic: str, workflow_type: str):
     prefix = {"review": "review", "research": "research", "progress_report": "prog"}
     thread_id = f"{prefix.get(workflow_type, 'wf')}_{topic[:20]}_{datetime.now().strftime('%Y%m%d_%H%M')}"
     config = {"configurable": {"thread_id": thread_id}}
+
+    # LangFuse tracing（已配置时自动启用）
+    from research_assistant.observability import get_tracer
+    tracer = get_tracer()
+    if tracer.enabled:
+        config["callbacks"] = [tracer.handler]
+
     set_runtime_context(thread_id, _storage=storage, _username=username)
 
     labels = {"review": "文献综述", "research": "深度研究", "progress_report": "进展评估"}

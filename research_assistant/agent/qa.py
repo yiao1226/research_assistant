@@ -301,6 +301,7 @@ def agent_loop(
     llm,
     max_rounds: int = 5,
     stream: bool = True,
+    callbacks: list | None = None,
 ) -> tuple[list, list]:
     """Agent 循环 — 工具调用用 invoke，最终回答用 stream。
 
@@ -314,17 +315,19 @@ def agent_loop(
         llm: bind_tools 后的 LLM（invoke 用）
         max_rounds: 最多工具调用轮次
         stream: 最终回答是否流式输出
+        callbacks: LangFuse/LangSmith callback handlers（传给 LLM invoke）
 
     Returns:
         (messages, tool_calls_log)
     """
+    invoke_config = {"callbacks": callbacks} if callbacks else {}
     tool_log = []
 
     for round_num in range(max_rounds):
         trigger_hooks("before_llm", messages)
 
         # ── 先用 invoke 检测是否有工具调用 ──
-        response = llm.invoke(messages)
+        response = llm.invoke(messages, config=invoke_config)
         has_tools = hasattr(response, 'tool_calls') and response.tool_calls
 
         # ── 有工具调用 → 执行后继续 ──
@@ -413,6 +416,10 @@ class QAService:
         from .background import get_bg_manager
         get_bg_manager(self.storage, self.username)
 
+        # LangFuse tracing（已配置时自动启用）
+        from ..observability import get_tracer
+        tracer = get_tracer()
+
         # 工具 + 动态 System Prompt
         tools = make_all_agent_tools(self.storage, self.username)
         _current_tools.clear()
@@ -434,8 +441,13 @@ class QAService:
             HumanMessage(content=question),
         ]
 
-        # ── Agent 循环 ──
-        messages, tool_log = agent_loop(messages, tools, llm_with_tools)
+        # ── Agent 循环（带 tracing）──
+        with tracer.session("qa", user=self.username,
+                            metadata={"question": question[:100]}) as trace_ctx:
+            callbacks = [trace_ctx.handler] if tracer.enabled else None
+            messages, tool_log = agent_loop(
+                messages, tools, llm_with_tools, callbacks=callbacks,
+            )
 
         # 清理
         HOOKS["before_llm"].remove(compaction)
