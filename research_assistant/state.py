@@ -164,8 +164,9 @@ def clear_runtime_context(thread_id: str = None):
         else:
             _runtime_context.clear()
         # 防止内存泄漏：超过上限时删除最旧的条目
+        # Python 3.7+ dict 保持插入顺序，keys() 返回的就是插入顺序
         excess = len(_runtime_context) - MAX_RUNTIME_CONTEXTS
         if excess > 0:
-            oldest = sorted(_runtime_context.keys())[:excess]
+            oldest = list(_runtime_context.keys())[:excess]
             for k in oldest:
                 _runtime_context.pop(k, None)

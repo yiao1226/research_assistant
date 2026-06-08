@@ -5,7 +5,10 @@ search_papers_online: 搜索 + 展示 + 交互选择入库
 """
 from __future__ import annotations
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+
+from ..utils import get_llm
 
 # 跨工具共享: 最近一次搜索结果缓存（供 ingest 工具使用）
 _last_search_papers: list[dict] = []
@@ -33,7 +36,7 @@ def make_search_tool(storage, username: str):
             print(f"     ⏳ 搜索 ArXiv + Semantic Scholar...", flush=True)
             from ..tools.search_orchestrator import SearchOrchestrator
             orch = SearchOrchestrator(storage, username)
-            result = orch.search(query, sources=["arxiv", "s2"])
+            result = orch.search(query, sources=["arxiv"])  # TODO: 等 S2_API_KEY 配好后加回 "s2"
             papers = result.get("papers", [])
             _last_search_papers = papers
 
@@ -57,15 +60,32 @@ def make_search_tool(storage, username: str):
                 print(f"      {core}")
 
             # 交互选择
-            print(f"\n  [I] 入库 (如 I1,3)  [D] 下载 (如 D1)  [S] 跳过  [Q] 追问")
+            print(f"\n  [I] 入库 (如 I1,3)  [D] 下载 (如 D1)  [S] 跳过  [Q] 追问  [B] 返回问答")
             choice = input("  > ").strip()
 
-            if choice.lower() == 's' or not choice:
-                return _format_result(papers, "用户选择跳过")
+            if choice.lower() == 's' or (not choice):
+                return "（用户跳过了搜索结果，不感兴趣。请回到正常问答模式，不要再搜索同一主题。）"
+
+            if choice.lower() == 'b':
+                return "（用户选择返回问答模式。请回到正常对话，不要再搜索或讨论这些论文。）"
 
             if choice.lower() == 'q':
                 follow_up = input("  想问什么？> ").strip()
-                return _format_result(papers, f"用户追问: {follow_up}")
+                if follow_up:
+                    # 直接在这里用 LLM 回答追问，不把论文列表传回给外层 LLM
+                    try:
+                        llm = get_llm(temperature=0.3, max_tokens=512)
+                        llm_answer = llm.invoke([
+                            SystemMessage(content="你是科研助手。简洁回答用户关于论文搜索结果的追问。"),
+                            HumanMessage(content=f"搜索结果共{len(papers)}篇论文。用户问: {follow_up}\n\n基于论文标题回答，不要编造。"),
+                        ])
+                        answer = str(llm_answer.content).strip()
+                        print(f"\n     {answer}")
+                    except Exception:
+                        answer = "抱歉，无法处理追问。"
+                else:
+                    answer = "（用户取消了追问）"
+                return f"用户追问: {follow_up}\n回答: {answer}\n\n请回到正常问答模式，不要再搜索同一主题。"
 
             # 解析 I/D 选项
             ingest_nums, download_nums = _parse_choice(choice, len(papers))

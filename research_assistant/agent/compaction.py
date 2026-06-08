@@ -1,8 +1,8 @@
 """上下文压缩 — 三段式，每轮 LLM 调用前自动触发。
 
-设计（参考 Claude Code s08）:
-  L1: tool_result_budget  — 单次工具返回 > 30KB → 存盘留预览
-  L2: micro_compact       — 旧 tool_result(>3轮前) → 占位符
+设计（适应 LangChain 消息格式）:
+  L1: tool_result_budget  — 单次 ToolMessage > 30KB → 存盘留预览
+  L2: micro_compact       — 旧 ToolMessage(>4条前) → 占位符
   L3: auto_compact        — 总 token 超阈值 → LLM 总结历史
 
 原则: 便宜的在前，贵的在后。L1/L2 零 API 调用。
@@ -15,15 +15,15 @@ import os
 import time
 from pathlib import Path
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
 
 # 阈值
-TOOL_RESULT_BUDGET = 30_000      # 单次 tool_result 超此 → 存盘
+TOOL_RESULT_BUDGET = 30_000      # 单次 ToolMessage 超此 → 存盘
 MESSAGE_COUNT_LIMIT = 40          # 消息数超此 → 触发 snip
 CONTEXT_TOKEN_ESTIMATE = 50_000   # token 估算超此 → LLM 总结
-KEEP_RECENT_TOOL_RESULTS = 4     # 保留最近 N 个 tool_result
+KEEP_RECENT_TOOL_RESULTS = 4     # 保留最近 N 个 ToolMessage
 
 # 存盘目录
 COMPACT_DIR = Path("./data/compact")
@@ -35,13 +35,14 @@ def estimate_tokens(messages: list) -> int:
 
 
 # ═══════════════════════════════════════════════════════════
-# L1: tool_result_budget — 大结果存盘
+# L1: tool_result_budget — 大 ToolMessage 存盘
 # ═══════════════════════════════════════════════════════════
 
-def _persist_large(tool_use_id: str, content: str) -> str:
+def _persist_large(tool_call_id: str, content: str) -> str:
     """存盘，返回预览。"""
     COMPACT_DIR.mkdir(parents=True, exist_ok=True)
-    path = COMPACT_DIR / f"tool_{tool_use_id}_{int(time.time())}.txt"
+    safe_id = tool_call_id.replace("/", "_").replace("\\", "_")[:40]
+    path = COMPACT_DIR / f"tool_{safe_id}_{int(time.time())}.txt"
     path.write_text(content, encoding="utf-8")
     preview = content[:2000]
     return (
@@ -53,47 +54,49 @@ def _persist_large(tool_use_id: str, content: str) -> str:
 
 
 def tool_result_budget(messages: list) -> list:
-    """L1: 单条 tool_result > 30KB → 存盘留预览。"""
-    last = messages[-1] if messages else None
-    if not last or not hasattr(last, 'role') or last.role != "user":
-        return messages
-    if not hasattr(last, 'content') or not isinstance(last.content, list):
-        return messages
-
-    for block in last.content:
-        if not isinstance(block, dict):
+    """L1: 单条 ToolMessage > 30KB → 存盘留预览。"""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, ToolMessage):
             continue
-        if block.get("type") != "tool_result":
-            continue
-        content = str(block.get("content", ""))
+        content = str(msg.content) if hasattr(msg, 'content') else ""
         if len(content) > TOOL_RESULT_BUDGET:
-            block["content"] = _persist_large(
-                block.get("tool_use_id", "unknown"), content
+            tid = getattr(msg, 'tool_call_id', 'unknown')
+            messages[i] = ToolMessage(
+                content=_persist_large(tid, content),
+                tool_call_id=tid,
             )
-            logger.info("L1压缩: %d → %d 字符", len(content), len(block["content"]))
+            logger.info("L1压缩: %d → %d 字符 (tool_call_id=%s)",
+                        len(content), len(str(messages[i].content)), tid)
+            break  # 只压缩最近一条大结果
     return messages
 
 
 # ═══════════════════════════════════════════════════════════
-# L2: micro_compact — 旧 tool_result → 占位符
+# L2: micro_compact — 旧 ToolMessage → 占位符
 # ═══════════════════════════════════════════════════════════
 
 def micro_compact(messages: list) -> list:
-    """L2: 超过 KEEP 个的旧 tool_result → '[已压缩]'。"""
-    result_blocks = []  # (msg_idx, block_idx, block)
-    for mi, msg in enumerate(messages):
-        if not hasattr(msg, 'content') or not isinstance(msg.content, list):
-            continue
-        for bi, block in enumerate(msg.content):
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                result_blocks.append((mi, bi, block))
+    """L2: 超过 KEEP 个的旧 ToolMessage → '[已压缩]'。"""
+    # 找出所有 ToolMessage 的索引
+    tm_indices = [
+        i for i, msg in enumerate(messages)
+        if isinstance(msg, ToolMessage)
+    ]
 
-    if len(result_blocks) <= KEEP_RECENT_TOOL_RESULTS:
+    if len(tm_indices) <= KEEP_RECENT_TOOL_RESULTS:
         return messages
 
-    for _, _, block in result_blocks[:-KEEP_RECENT_TOOL_RESULTS]:
-        if len(str(block.get("content", ""))) > 120:
-            block["content"] = "[已压缩 — 重新执行工具可获取完整结果]"
+    # 保留最后 KEEP_RECENT_TOOL_RESULTS 条，其余压缩
+    for idx in tm_indices[:-KEEP_RECENT_TOOL_RESULTS]:
+        msg = messages[idx]
+        content = str(msg.content) if hasattr(msg, 'content') else ""
+        if len(content) > 120:
+            tid = getattr(msg, 'tool_call_id', '')
+            messages[idx] = ToolMessage(
+                content="[已压缩 — 重新执行工具可获取完整结果]",
+                tool_call_id=tid,
+            )
 
     return messages
 

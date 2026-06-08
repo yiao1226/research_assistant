@@ -196,9 +196,15 @@ def node_research(state: ResearchState) -> dict[str, Any]:
 
 
 def _merge_papers_from_text(papers: list, text: str):
-    """从工具返回文本解析并合并论文（去重）。"""
+    """从工具返回文本解析并合并论文（去重）。
+
+    优先使用结构化正则匹配，失败时回退到宽松标题提取。
+    """
     import re
     seen = {p.get("title", "") for p in papers}
+    matched = False
+
+    # 主路径：结构化正则匹配
     for m in re.finditer(r'\[(\d+)\]\s+(.+?)\n\s+评分:\s*([\d.]+).*?引用:\s*(\d+).*?年份:\s*(\d+)', str(text), re.DOTALL):
         title = m.group(2).strip()
         if title not in seen:
@@ -208,6 +214,21 @@ def _merge_papers_from_text(papers: list, text: str):
                 "composite_score": float(m.group(3)),
                 "citation_count": int(m.group(4)), "year": m.group(5),
             })
+            matched = True
+
+    # 降级：宽松提取 `[N] 标题` 行（正则失败时兜底）
+    if not matched:
+        for m in re.finditer(r'\[(\d+)\]\s+(.+)', str(text)):
+            title = m.group(2).strip()
+            # 截取到第一个换行或评分前
+            title = re.split(r'\n|评分:', title)[0].strip()
+            if title and title not in seen and len(title) > 5:
+                seen.add(title)
+                papers.append({
+                    "index": int(m.group(1)), "title": title,
+                    "composite_score": 0.0,
+                    "citation_count": 0, "year": "",
+                })
 
 
 def _check_satisfied(text: str, count: int, iteration: int) -> bool:

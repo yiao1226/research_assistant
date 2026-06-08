@@ -77,9 +77,11 @@ class WorkingMemory:
     """
 
     def __init__(self, username: str, user_dir: str = "",
-                 *, debounce_seconds: float = DEFAULT_DEBOUNCE):
+                 *, debounce_seconds: float = DEFAULT_DEBOUNCE,
+                 storage=None):
         self.username = username
         self.user_dir = user_dir  # PerUserStorage.user_dir，用于 episodic 持久化
+        self._external_storage = storage  # 外部传入的 PerUserStorage（避免重复创建）
         self.turns: list[QATurn] = []
         self._consolidated: list[str] = []  # 已压缩的历史摘要
         self._episodic = None  # 延迟加载
@@ -101,16 +103,19 @@ class WorkingMemory:
 
     @property
     def episodic(self):
-        """延迟加载情景记忆（避免循环导入）。"""
+        """延迟加载情景记忆（优先复用外部传入的 storage，避免重复创建 PerUserStorage）。"""
         if self._episodic is None:
-            from ..core.storage import PerUserStorage
             from ..memory.episodic import EpisodicMemory
-            from pathlib import Path
-            if self.user_dir:
-                user_dir = Path(self.user_dir)
+            if self._external_storage is not None:
+                storage = self._external_storage
             else:
-                user_dir = Path("./data/users") / self.username
-            storage = PerUserStorage(user_dir)
+                from ..core.storage import PerUserStorage
+                from pathlib import Path
+                if self.user_dir:
+                    user_dir = Path(self.user_dir)
+                else:
+                    user_dir = Path("./data/users") / self.username
+                storage = PerUserStorage(user_dir)
             self._episodic = EpisodicMemory(storage, self.username)
         return self._episodic
 
@@ -364,8 +369,9 @@ class WorkingMemory:
             summary = f"（已丢弃 {EVICT_BATCH} 轮对话）"
             self._consolidated.append(summary)
 
-        # 移除已压缩的轮次
+        # 移除已压缩的轮次，同步调整事实提取进度指针
         self.turns = self.turns[EVICT_BATCH:]
+        self._last_extracted_index = max(0, self._last_extracted_index - EVICT_BATCH)
 
     def get_session_summary(self) -> dict:
         """生成整个会话的摘要（退出时调用）。

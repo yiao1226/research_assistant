@@ -235,8 +235,12 @@ class BackupManager:
                 file_path = paper.get("file_path", "")
                 full_text = ""
                 if file_path and os.path.exists(file_path):
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        full_text = f.read()
+                    try:
+                        from ..loaders import load_document
+                        full_text, _ = load_document(file_path)
+                    except Exception:
+                        self.log_system("WARN", f"重建: paper_id={paper.get('id')} 文件加载失败 {file_path}")
+                        full_text = ""
 
                 if full_text:
                     chunks = pipeline.chunk_paper(full_text, paper["id"], annotation or {})

@@ -167,10 +167,10 @@ class SearchOrchestrator:
             except Exception:
                 return []
 
-        for q in sorted_queries[:5]:
-            query_str = q["query"]
-            max_r = 10 if q.get("priority") == "high" else 5
-            with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, len(sources))) as executor:
+            for q in sorted_queries[:5]:
+                query_str = q["query"]
+                max_r = 10 if q.get("priority") == "high" else 5
                 futures = {executor.submit(_search_one, src, query_str, max_r): src for src in sources}
                 for future in as_completed(futures):
                     for paper in future.result():

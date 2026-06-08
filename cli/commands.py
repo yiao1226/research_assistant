@@ -87,7 +87,7 @@ BASE_DIR = None
 AVAILABLE_SOURCES = {}
 TYPE_LABELS = {}
 
-_qa_instance = None
+_qa_instances: dict[str, object] = {}  # keyed by username，用户切换时正确隔离
 _storage_cache = None
 
 
@@ -130,16 +130,21 @@ def get_backup():
 
 
 def get_qa():
+    """获取当前用户的 QA 服务实例（按 username 缓存）。
+
+    用户切换时自动创建新实例，旧实例保留在缓存中。
+    """
     from research_assistant.agent import QAService
-    global _qa_instance
+    global _qa_instances
     if not user_manager.is_logged_in:
         return None
     s = get_storage()
     if not s:
         return None
-    if _qa_instance is None:
-        _qa_instance = QAService(user_manager.current_user.username, s)
-    return _qa_instance
+    username = user_manager.current_user.username
+    if username not in _qa_instances:
+        _qa_instances[username] = QAService(username, s)
+    return _qa_instances[username]
 
 
 # ── 命令实现 ──
@@ -726,11 +731,23 @@ def _run_graph_workflow(topic: str, workflow_type: str):
     labels = {"review": "文献综述", "research": "深度研究", "progress_report": "进展评估"}
     print(f"\n[START] 启动{labels.get(workflow_type, '工作流')}: {topic}\n")
 
+    # 记录工作流开始前的 KB 论文数（供日志用）
+    kb_papers_before = len(storage.get_all_papers()) if storage else 0
+
     stage_labels = {
         "understand": "📊 盘点现状 + 制定策略",
         "research": "🔍 搜索分析",
         "synthesize": "📝 综合撰写",
         "user_review": "👤 人机审查",
+    }
+
+    # 跟踪工作流指标
+    wf_metrics = {
+        "new_papers": 0,
+        "word_count": 0,
+        "conclusion": "",
+        "key_findings": "",
+        "duration_start": datetime.now(),
     }
 
     try:
@@ -760,6 +777,10 @@ def _run_graph_workflow(topic: str, workflow_type: str):
                             print("\n✅ 已确认，工作流完成。")
                         elif rd.get("user_feedback"):
                             print(f"\n🔄 按反馈调整中...")
+                        # 捕获 resume 后的 synthesize 指标
+                        if rd.get("final_output"):
+                            wf_metrics["word_count"] = len(rd.get("final_output", ""))
+                            wf_metrics["conclusion"] = (rd.get("final_output", "") or "")[:300]
                         stage = rd.get("current_stage", rn)
                         if stage in stage_labels and stage != "user_review":
                             print(f"  {stage_labels.get(stage, stage)}")
@@ -779,12 +800,15 @@ def _run_graph_workflow(topic: str, workflow_type: str):
                 papers = node_data.get("papers_found", [])
                 it = node_data.get("search_iterations", 0)
                 satisfied = node_data.get("agent_satisfied", False)
+                wf_metrics["new_papers"] = len(papers)
                 print(f"  第{it}轮 | 累计: {len(papers)}篇 | {'✅ 满意' if satisfied else '🔄 继续'}")
                 if node_data.get("search_summary"):
                     print(f"  {node_data['search_summary'][:300]}")
             elif stage == "synthesize":
                 output = node_data.get("final_output", "")
                 cited = node_data.get("cited_papers", [])
+                wf_metrics["word_count"] = len(output)
+                wf_metrics["conclusion"] = output[:300] if output else ""
                 if output and workflow_type != "review":
                     # research 直接展示
                     pass
@@ -809,10 +833,18 @@ def _run_graph_workflow(topic: str, workflow_type: str):
         import traceback
         traceback.print_exc()
 
-    # 操作日志
+    # 操作日志（携带实际工作流指标）
     backup = get_backup()
     if backup:
-        backup.log_review(topic, 0, 0, 0, 0, conclusion="")
+        duration = (datetime.now() - wf_metrics["duration_start"]).total_seconds()
+        backup.log_review(
+            topic,
+            kb_papers=kb_papers_before,
+            new_papers=wf_metrics["new_papers"],
+            word_count=wf_metrics["word_count"],
+            duration_sec=duration,
+            conclusion=wf_metrics["conclusion"],
+        )
 
 
 def _on_quit():

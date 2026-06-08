@@ -574,7 +574,7 @@ class HybridRetriever:
             try:
                 from ..memory.user_profile import UserProfileManager
                 user_dir = str(getattr(self.storage, 'user_dir', ''))
-                username = getattr(self, '_username', '')
+                username = getattr(self, 'username', '')
                 if user_dir and username:
                     pm = UserProfileManager(username, user_dir)
                     profile_data = pm.load_facts()

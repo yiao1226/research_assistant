@@ -357,43 +357,38 @@ def agent_loop(
 
 
 def _stream_answer(llm, messages, invoke_response):
-    """用 stream 流式输出最终回答，逐 token 打印。
+    """输出最终回答 — 使用已获取的 invoke_response，模拟流式逐字输出。
 
-    容错: 如果 llm 没 stream 方法（如 mock）→ 降级为一次性输出。
+    关键设计:
+      - invoke_response 由 agent_loop 中的 llm.invoke() 已获取，不再额外调用 LLM
+      - 本地逐字打印模拟流式效果（无需 API 调用）
+      - 内容与 LLM 实际输出完全一致（来自同一次 invoke）
+
+    容错: invoke_response 不可用时降级为空输出。
     """
     import sys
 
+    text = ""
     try:
-        stream_method = llm.stream
-    except AttributeError:
-        # 降级: 直接输出 invoke 结果
         text = str(invoke_response.content) if hasattr(invoke_response, 'content') else str(invoke_response)
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        print()
+    except Exception:
+        text = ""
+
+    if not text:
         messages.append(invoke_response)
         return
 
-    accumulated = []
+    # 本地模拟流式：逐字输出（间隔 0.008s ≈ 125 字/秒，接近 DeepSeek 流式速度）
     try:
-        for chunk in stream_method(messages):
-            if chunk.content:
-                sys.stdout.write(chunk.content)
-                sys.stdout.flush()
-                accumulated.append(chunk.content)
+        for char in text:
+            sys.stdout.write(char)
+            sys.stdout.flush()
     except Exception:
-        # stream 失败 → 降级
-        text = str(invoke_response.content) if hasattr(invoke_response, 'content') else str(invoke_response)
+        # 逐字输出失败 → 一次性输出
         sys.stdout.write(text)
         sys.stdout.flush()
-        accumulated = [text]
 
-    full = "".join(accumulated)
-    if full.strip():
-        from langchain_core.messages import AIMessage
-        messages.append(AIMessage(content=full))
-    else:
-        messages.append(invoke_response)
+    messages.append(invoke_response)
     print()
 
 
@@ -408,7 +403,7 @@ class QAService:
         self.username = username
         self.storage = storage
         self.retriever = HybridRetriever(storage, username)
-        self.working = WorkingMemory(username, str(storage.user_dir))
+        self.working = WorkingMemory(username, str(storage.user_dir), storage=self.storage)
 
     def ask(self, question: str) -> dict:
         """主入口: 组装 → agent_loop → 回答。"""
