@@ -20,7 +20,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .paper_search import search_arxiv, search_semantic_scholar, search_web_of_science
 from ..core.storage import PerUserStorage
-from ..utils import get_llm, extract_json_from_llm_response
+from ..utils import get_llm
+from ..schemas import QueryExpansionResult, RankingResult
 
 QUERY_UNDERSTANDING_PROMPT = """你是学术搜索策略专家。将查询扩展为更全面的搜索策略。
 
@@ -127,7 +128,7 @@ class SearchOrchestrator:
     # === Step 2: Query Understanding ===
 
     def expand_query(self, raw_query: str, ctx: SearchContext) -> list[dict]:
-        """LLM 驱动关键词扩展。"""
+        """LLM 驱动关键词扩展（Pydantic 结构化输出，自动校验）。"""
         llm = get_llm(temperature=0.2)
         prompt = QUERY_UNDERSTANDING_PROMPT.format(
             topics="、".join(ctx.topics) if ctx.topics else "未指定",
@@ -137,11 +138,13 @@ class SearchOrchestrator:
             raw_query=raw_query,
         )
         try:
-            response = llm.invoke([
-                SystemMessage(content="你是学术搜索策略专家。只返回 JSON。"),
+            structured_llm = llm.with_structured_output(QueryExpansionResult)
+            result = structured_llm.invoke([
+                SystemMessage(content="你是学术搜索策略专家。"),
                 HumanMessage(content=prompt),
             ])
-            return extract_json_from_llm_response(str(response.content)).get("expanded_queries", [])
+            return [{"query": q.query, "rationale": q.rationale, "priority": q.priority}
+                    for q in result.expanded_queries]
         except Exception:
             return [{"query": raw_query, "rationale": "原始查询", "priority": "high"}]
 
@@ -205,18 +208,18 @@ class SearchOrchestrator:
         prompt = RANKING_PROMPT.format(query=query, sort_by=sort_by, papers_text=papers_text)
 
         try:
-            response = llm.invoke([
-                SystemMessage(content="只返回 JSON。"),
+            structured_llm = llm.with_structured_output(RankingResult)
+            result = structured_llm.invoke([
+                SystemMessage(content="你是学术论文检索排序专家。"),
                 HumanMessage(content=prompt),
             ])
-            ranked = extract_json_from_llm_response(str(response.content)).get("ranked", [])
-            for item in ranked:
-                idx = item.get("index", 1) - 1
+            for item in result.ranked:
+                idx = item.index - 1
                 if 0 <= idx < len(papers):
-                    papers[idx]["core_contribution"] = item.get("core_contribution", "")
-                    papers[idx]["innovation"] = item.get("innovation", "")
-                    papers[idx]["relevance_reason"] = item.get("relevance_reason", "")
-                    papers[idx]["ranking_reason"] = item.get("ranking_reason", "")
+                    papers[idx]["core_contribution"] = item.core_contribution
+                    papers[idx]["innovation"] = item.innovation
+                    papers[idx]["relevance_reason"] = item.relevance_reason
+                    papers[idx]["ranking_reason"] = item.ranking_reason
                     papers[idx]["composite_score"] = 100 - idx * 5  # LLM排序位置→分数
             papers.sort(key=lambda p: p.get("composite_score", 0), reverse=True)
         except Exception:

@@ -12,7 +12,7 @@ import os
 import time
 from typing import Callable
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ..utils import get_llm
 from ..core.storage import PerUserStorage
@@ -336,7 +336,7 @@ def agent_loop(
         trigger_hooks("before_llm", messages)
 
         # ── 流式调用 + 累积完整响应 ──
-        full: "AIMessage | None" = None
+        full: AIMessage | None = None
         for chunk in llm.stream(messages, config=invoke_config):
             full = chunk if full is None else full + chunk
             # 每个 token 立刻回调（tool_calls 决策时 content 通常为空）

@@ -22,6 +22,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from ..core.storage import PerUserStorage
 from .vector_store import VectorStore
 from ..utils import get_llm, extract_json_from_llm_response
+from ..schemas import PaperAnnotation
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +104,16 @@ class IngestionPipeline:
             return {"error": "无可用文本", "quality": "none"}
 
         try:
-            response = llm.invoke([
+            structured_llm = llm.with_structured_output(PaperAnnotation)
+            result = structured_llm.invoke([
                 SystemMessage(content=ANNOTATION_SYSTEM_PROMPT),
                 HumanMessage(content=text_input),
             ])
-            annotation = extract_json_from_llm_response(str(response.content))
+            annotation = result.model_dump()
             annotation["annotation_quality"] = quality
+            # methods 从 Pydantic model 序列化为 list[dict]
             return annotation
-        except (json.JSONDecodeError, AttributeError):
+        except Exception:
             return {
                 "keywords_material": [],
                 "keywords_method": [],
