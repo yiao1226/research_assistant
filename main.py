@@ -348,19 +348,20 @@ def interactive_mode():
             continue
 
         print()
-        result = qa.ask(cmd)
+
+        # 真流式：每个 token 立刻 print 到终端
+        def _cli_token(text: str):
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+        result = qa.ask(cmd, on_token=_cli_token)
+        print()  # answer 流式输出完毕，换行
 
         # 工具调用日志
         tool_calls = result.get('tool_calls', [])
         if tool_calls:
             tools_used = {tc['tool'] for tc in tool_calls}
             print(f'🔧 调用了: {", ".join(tools_used)}  ({len(tool_calls)}次)')
-
-        # 流式输出已在 agent_loop 里打印过，不重复
-        if not result.get('streamed'):
-            print(f'\n{"=" * 60}')
-            print(result['answer'])
-            print(f'{"=" * 60}')
 
         cited = result.get('cited_papers', [])
         if cited:

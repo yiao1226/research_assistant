@@ -97,7 +97,7 @@ def _format_papers(papers: list[dict]) -> str:
             groups[pid]["core"] = p.get("core_claim")
         groups[pid]["chunks"].append({
             "heading": p.get("heading_path", ""),
-            "text": text[:800],
+            "text": text[:1500],
         })
 
     items = list(groups.items())[:5]

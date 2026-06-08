@@ -68,17 +68,24 @@ def _tool_log_hook(name: str, args: dict):
     return None
 
 def _tool_result_hook(_name: str, _args: dict, result: str):
-    """post_tool: 显示工具结果摘要。"""
-    import sys
-    preview = str(result)[:120].replace("\n", " ")
-    print(f"     → {preview}", flush=True)
+    """post_tool: 显示工具结果摘要（展示找到的论文标题）。"""
+    import sys, re
+    raw = str(result)
+    # 提取所有 [论文N] 标题行
+    titles = re.findall(r'\[论文\d+\]\s+(.+)', raw)
+    if titles:
+        shown = [t[:50] for t in titles[:5]]
+        print(f"     → 找到 {len(titles)} 篇: {' | '.join(shown)}", flush=True)
+    else:
+        preview = raw[:80].replace("\n", " ")
+        print(f"     → {preview}", flush=True)
 
 def _agent_done_hook(result: dict):
     """agent_end: 显示统计。"""
     calls = len(result.get("tool_calls", []))
     if calls:
         tools_used = {tc["tool"] for tc in result["tool_calls"]}
-        print(f"✅ 完成 ({calls}次工具调用: {', '.join(tools_used)})")
+        print(f"\n✅ 完成 ({calls}次工具调用: {', '.join(tools_used)})")
 
 
 register_hook("agent_start", _progress_hook)
@@ -300,22 +307,24 @@ def agent_loop(
     tools: list,
     llm,
     max_rounds: int = 5,
-    stream: bool = True,
     callbacks: list | None = None,
+    on_token: "Callable[[str], None] | None" = None,
 ) -> tuple[list, list]:
-    """Agent 循环 — 工具调用用 invoke，最终回答用 stream。
+    """Agent 循环 — llm.stream() 真流式，一次调用同时完成 token 输出 + tool 检测。
 
     设计:
-      - 工具调用阶段: invoke → 需要完整 tool_calls 才能执行
-      - 最终回答: stream → 逐 token 输出，用户看到打字效果
+      - 全程用 llm.stream() → 每生成一个 token 立刻通过 on_token 回调
+      - 流式过程中自动累积 AIMessageChunk → 结束后检测 tool_calls
+      - 有工具调用 → 执行后继续循环（工具决策阶段 content 通常为空，不影响用户）
+      - 无工具调用 → 回答已通过 on_token 实时展示完毕
 
     Args:
         messages: [SystemMessage, HumanMessage, ...]
         tools: LangChain @tool 列表
-        llm: bind_tools 后的 LLM（invoke 用）
+        llm: bind_tools 后的 LLM
         max_rounds: 最多工具调用轮次
-        stream: 最终回答是否流式输出
-        callbacks: LangFuse/LangSmith callback handlers（传给 LLM invoke）
+        callbacks: LangFuse/LangSmith callback handlers
+        on_token: 每收到一个 token chunk 立刻回调（CLI → print, API → SSE yield）
 
     Returns:
         (messages, tool_calls_log)
@@ -326,15 +335,22 @@ def agent_loop(
     for round_num in range(max_rounds):
         trigger_hooks("before_llm", messages)
 
-        # ── 先用 invoke 检测是否有工具调用 ──
-        response = llm.invoke(messages, config=invoke_config)
-        has_tools = hasattr(response, 'tool_calls') and response.tool_calls
+        # ── 流式调用 + 累积完整响应 ──
+        full: "AIMessage | None" = None
+        for chunk in llm.stream(messages, config=invoke_config):
+            full = chunk if full is None else full + chunk
+            # 每个 token 立刻回调（tool_calls 决策时 content 通常为空）
+            if chunk.content and on_token:
+                on_token(chunk.content)
 
         # ── 有工具调用 → 执行后继续 ──
-        if has_tools:
-            trigger_hooks("after_llm", response)
-            messages.append(response)
-            for tc in response.tool_calls:
+        if full is not None and full.tool_calls:
+            # 流式文本和工具输出之间补换行
+            if on_token and full.content:
+                on_token("\n")
+            trigger_hooks("after_llm", full)
+            messages.append(full)
+            for tc in full.tool_calls:
                 name = tc.get("name", "unknown")
                 args = tc.get("args", {})
                 tid = tc.get("id", "")
@@ -347,52 +363,13 @@ def agent_loop(
                 messages.append(ToolMessage(content=str(result), tool_call_id=tid))
             continue
 
-        # ── 无工具调用 → 流式输出最终回答 ──
-        if stream:
-            _stream_answer(llm, messages, response)
-        else:
-            messages.append(response)
-
-        trigger_hooks("after_llm", messages[-1])
+        # ── 无工具调用 → 最终回答已流式展示完毕 ──
+        if full is not None:
+            messages.append(full)
+        trigger_hooks("after_llm", messages[-1] if full else None)
         break
 
     return messages, tool_log
-
-
-def _stream_answer(llm, messages, invoke_response):
-    """输出最终回答 — 使用已获取的 invoke_response，模拟流式逐字输出。
-
-    关键设计:
-      - invoke_response 由 agent_loop 中的 llm.invoke() 已获取，不再额外调用 LLM
-      - 本地逐字打印模拟流式效果（无需 API 调用）
-      - 内容与 LLM 实际输出完全一致（来自同一次 invoke）
-
-    容错: invoke_response 不可用时降级为空输出。
-    """
-    import sys
-
-    text = ""
-    try:
-        text = str(invoke_response.content) if hasattr(invoke_response, 'content') else str(invoke_response)
-    except Exception:
-        text = ""
-
-    if not text:
-        messages.append(invoke_response)
-        return
-
-    # 本地模拟流式：逐字输出（间隔 0.008s ≈ 125 字/秒，接近 DeepSeek 流式速度）
-    try:
-        for char in text:
-            sys.stdout.write(char)
-            sys.stdout.flush()
-    except Exception:
-        # 逐字输出失败 → 一次性输出
-        sys.stdout.write(text)
-        sys.stdout.flush()
-
-    messages.append(invoke_response)
-    print()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -408,8 +385,14 @@ class QAService:
         self.retriever = HybridRetriever(storage, username)
         self.working = WorkingMemory(username, str(storage.user_dir), storage=self.storage)
 
-    def ask(self, question: str) -> dict:
-        """主入口: 组装 → agent_loop → 回答。"""
+    def ask(self, question: str, on_token: "Callable[[str], None] | None" = None) -> dict:
+        """主入口: 组装 → agent_loop → 回答。
+
+        Args:
+            question: 用户问题
+            on_token: 可选的 token 流回调。CLI 传入 print，API SSE 传入 queue put。
+                      为 None 时 token 不流式展示（仅返回完整 answer）
+        """
         trigger_hooks("agent_start", question)
 
         # 初始化后台任务管理器
@@ -441,12 +424,13 @@ class QAService:
             HumanMessage(content=question),
         ]
 
-        # ── Agent 循环（带 tracing）──
+        # ── Agent 循环（带 tracing + 真流式 on_token）──
         with tracer.session("qa", user=self.username,
                             metadata={"question": question[:100]}) as trace_ctx:
             callbacks = [trace_ctx.handler] if tracer.enabled else None
             messages, tool_log = agent_loop(
-                messages, tools, llm_with_tools, callbacks=callbacks,
+                messages, tools, llm_with_tools,
+                callbacks=callbacks, on_token=on_token,
             )
 
         # 清理
@@ -533,11 +517,53 @@ def _exec_tool(tc: dict, tools: list) -> str:
 
 
 def _extract_cited_from_messages(messages: list) -> list[dict]:
+    """从工具返回中收集论文，匹配 LLM 最终回答里实际引用了哪些。
+
+    两步:
+      1. 从所有 ToolMessage 中提取 [论文N] → 标题的映射
+      2. 在最终回答中搜索这些标题 → 出现在回答里的才算引用
+    """
     import re
-    papers = []
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    # Step 1: 从工具返回中收集论文标题
+    paper_map: dict[int, str] = {}  # index → title
     for msg in messages:
-        if hasattr(msg, 'content'):
+        if isinstance(msg, ToolMessage):
             text = str(msg.content)
             for m in re.finditer(r'\[论文(\d+)\]\s+(.+)', text):
-                papers.append({"index": int(m.group(1)), "title": m.group(2)[:100]})
+                idx = int(m.group(1))
+                title = m.group(2).strip()
+                # 截取到第一个换行（标题行可能很长但第一段就是标题）
+                title = title.split("\n")[0][:100]
+                if idx not in paper_map:
+                    paper_map[idx] = title
+
+    if not paper_map:
+        return []
+
+    # Step 2: 在最终回答中搜索这些标题
+    final_answer = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+            final_answer = str(msg.content)
+            break
+
+    if not final_answer:
+        return []
+
+    # Unicode 归一化：化学式下标等（MAPbBr₃ → MAPbBr3）
+    import unicodedata
+    def _norm(s: str) -> str:
+        return unicodedata.normalize("NFKC", s)
+
+    final_norm = _norm(final_answer)
+    papers = []
+    for idx, title in paper_map.items():
+        title_norm = _norm(title)
+        # 取前 12 个字符做模糊匹配（归一化后足够短的指纹）
+        key = title_norm[:12]
+        if len(key) >= 5 and key in final_norm:
+            papers.append({"index": idx, "title": title})
+
     return papers

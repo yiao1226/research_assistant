@@ -73,11 +73,19 @@ async def chat_stream(req: ChatRequest):
             )
         )
 
-    # 注入 SSE hooks（临时替换内置 CLI hooks）
+    # 注入 SSE hooks + on_token 回调（注册后在子线程中实时推事件到队列）
     from research_assistant.agent.qa import register_hook
     register_hook("agent_start", sse_thinking)
     register_hook("pre_tool", sse_tool_call)
     register_hook("post_tool", sse_tool_result)
+
+    # on_token: LLM 每生成一个 token → 推到 SSE + 打印到服务端终端
+    def _sse_on_token(text: str):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        main_loop.call_soon_threadsafe(
+            lambda t=text: sse_queue.put_nowait(_sse("token", {"delta": t}))
+        )
 
     async def event_generator():
         # 并发运行：QA 在后台执行 + 实时 drain SSE 事件队列
@@ -85,8 +93,10 @@ async def chat_stream(req: ChatRequest):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         try:
-            # 提交 QA 任务到线程池
-            future = main_loop.run_in_executor(pool, qa.ask, req.message)
+            # 提交 QA 任务（on_token 实时推 token 事件到队列）
+            future = main_loop.run_in_executor(
+                pool, qa.ask, req.message, _sse_on_token,
+            )
 
             # 实时 drain queue，直到 QA 完成
             while not future.done():
@@ -99,7 +109,7 @@ async def chat_stream(req: ChatRequest):
             # QA 完成，获取结果
             result = future.result()
 
-            # drain 残留事件
+            # drain 残留事件（包括最后几个 token）
             while not sse_queue.empty():
                 yield sse_queue.get_nowait()
 
@@ -110,12 +120,7 @@ async def chat_stream(req: ChatRequest):
                     {"title": p.get("title", "?")[:80]} for p in cited[:5]
                 ]})
 
-            # 流式输出最终回答（逐字发送）
-            answer = result.get("answer", "")
-            for char in answer:
-                yield _sse("token", {"delta": char})
-
-            # 完成
+            # 完成（token 已通过 on_token 实时发出，不再重复）
             tool_calls = len(result.get("tool_calls", []))
             yield _sse("done", {
                 "tool_calls": tool_calls,
