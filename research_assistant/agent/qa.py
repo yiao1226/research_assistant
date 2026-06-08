@@ -299,7 +299,7 @@ def agent_loop(
     messages: list,
     tools: list,
     llm,
-    max_rounds: int = 3,
+    max_rounds: int = 5,
     stream: bool = True,
 ) -> tuple[list, list]:
     """Agent 循环 — 工具调用用 invoke，最终回答用 stream。
